@@ -3,11 +3,14 @@ import matplotlib.pylab as plt
 from matplotlib import cm
 from time import time
 import pyvista as pv
+from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import map_coordinates
 from jax.image import resize
 from jax import jit
 import jax.numpy as jnp
 from functools import partial
 import trimesh
+import vtk
 import open3d as o3d
 import h5py
 
@@ -145,6 +148,170 @@ def save_fields_vtk(fields, timestep, output_dir=".", prefix="fields", shift_coo
     grid.save(output_filename, binary=True)
     print(f"Saved {output_filename} in {time() - start:.6f} seconds.")
 
+def map_field_vtk_interpolator(field, stl_filename, voxel_size, output_dir=".", prefix="mapped_field", origin=[0, 0, 0], method='cubic', normals=True):
+    """
+    Map a volumetric field onto an STL mesh using RegularGridInterpolator.
+    
+    Parameters
+    ----------
+    field : np.ndarray
+        3D array representing the volumetric field.
+    stl_filename : str
+        Path to the STL file.
+    voxel_size : float
+        Size of a voxel along each axis.
+    output_dir : str, optional
+        Directory to save the output VTK file.
+    prefix : str, optional
+        Filename prefix.
+    origin : list or tuple of float, optional
+        Origin of the grid.
+    method : str, optional
+        Interpolation method (e.g., 'cubic').
+    normals : bool, optional
+        If True, use normal-direction averaging by sampling points offset along the surface normal;
+        if False, simply sample the field at the surface points.
+    
+    Returns
+    -------
+    None
+    """
+
+    print("Mapping field to stl with {} method".format("normal averaging" if normals else "original sampling"))
+    start = time()
+    grid_shape = field.shape
+
+    # Create coordinate arrays based on the origin and voxel size.
+    x = origin[0] + np.arange(grid_shape[0]) * voxel_size
+    y = origin[1] + np.arange(grid_shape[1]) * voxel_size
+    z = origin[2] + np.arange(grid_shape[2]) * voxel_size
+
+    # Set up the interpolation function.
+    interp_func = RegularGridInterpolator((x, y, z), field,
+                                            method=method,
+                                            bounds_error=False,
+                                            fill_value=None)
+
+    # Load the STL mesh.
+    stl_mesh = pv.read(stl_filename)
+
+    if normals:
+        # Compute normals if not already available.
+        if 'Normals' not in stl_mesh.point_data:
+            stl_mesh = stl_mesh.compute_normals()
+        normals_arr = stl_mesh.point_normals  # shape (N, 3)
+        points = stl_mesh.points             # shape (N, 3)
+
+        # Define offsets along the normal: sample 2 voxels in both directions including the surface.
+        offsets = np.array([-2, 2]) * voxel_size  # shape (5,)
+        #offsets = np.array([-2, -1, 0, 1, 2]) * voxel_size  # shape (5,)
+        # Generate sample points along the normal for each mesh point.
+        sample_points = points[:, np.newaxis, :] + offsets[np.newaxis, :, np.newaxis] * normals_arr[:, np.newaxis, :]
+        sample_points_reshaped = sample_points.reshape(-1, 3)
+
+        # Interpolate the field at each of the sample points.
+        field_values = interp_func(sample_points_reshaped)
+        field_values = field_values.reshape(points.shape[0], len(offsets))
+        # Average the values along the normal offset direction.
+        field_mapped = np.mean(field_values, axis=1)
+    else:
+        # Original: simply sample the field at the surface points.
+        points = stl_mesh.points
+        field_mapped = interp_func(points)
+
+    # Assign the mapped field to the mesh and save.
+    stl_mesh["field"] = field_mapped
+    output_filename = os.path.join(output_dir, prefix + ".vtk")
+    stl_mesh.save(output_filename)
+    print(f"Saved {output_filename} in {time() - start:.6f} seconds.")
+
+
+def map_field_vtk(field, stl_filename, output_dir=".", prefix="mapped_field", shift_coords=(0, 0, 0), scale=1, normals=True):
+    """
+    Save VTK fields to the specified directory by probing a uniform grid
+    generated from a field array onto an STL mesh. If normals is True, for
+    each STL point the field is averaged over points offset along the surface normal.
+    
+    Parameters
+    ----------
+    field : np.ndarray
+        The field data (2D or 3D) to be mapped.
+    stl_filename : str
+        Path to the STL file.
+    output_dir : str, optional
+        Directory to save the output VTK file.
+    prefix : str, optional
+        Filename prefix.
+    shift_coords : tuple, optional
+        Origin (shift) for the uniform grid.
+    scale : int or float, optional
+        Spacing of the uniform grid.
+    normals : bool, optional
+        If True, average field values along the surface normal (sampling 2 voxels on either side);
+        if False, use the original probe method.
+    
+    Returns
+    -------
+    None
+    """
+    start = time()
+    method_str = "normal averaging" if normals else "original sampling"
+    print(f"Mapping field to stl with {method_str}")
+    output_filename = os.path.join(output_dir, prefix + ".vtk")
+
+    # Create the uniform grid dimensions (note: cell values require dimensions + 1).
+    dimensions = tuple(dim + 1 for dim in field.shape)
+    if field.ndim == 2:
+        dimensions = dimensions + (1,)
+
+    # Create a uniform grid (ImageData) with the specified origin and spacing.
+    grid = pv.ImageData(dimensions=dimensions, origin=shift_coords, spacing=(scale, scale, scale))
+    grid.cell_data["field"] = field.flatten(order="F")
+    grid = grid.cell_data_to_point_data()
+
+    # Load the STL mesh.
+    stl_mesh = pv.read(stl_filename)
+
+    if normals:
+        # Compute normals if not available.
+        if 'Normals' not in stl_mesh.point_data:
+            stl_mesh = stl_mesh.compute_normals()
+        normals_arr = stl_mesh.point_normals  # shape (N, 3)
+        points = stl_mesh.points             # shape (N, 3)
+
+        # Define offsets along the normal: sample 2 voxels in both directions.
+        offsets = np.array([-2, 2]) * scale
+        #offsets = np.array([-2, -1, 0, 1, 2]) * scale
+        # Generate sample points along the normal for each STL point.
+        sample_points = points[:, np.newaxis, :] + offsets[np.newaxis, :, np.newaxis] * normals_arr[:, np.newaxis, :]
+        sample_points_reshaped = sample_points.reshape(-1, 3)
+
+        # Create a PolyData object from these sample points.
+        samples_pd = pv.PolyData(sample_points_reshaped)
+
+        # Use vtkProbeFilter to sample the grid at these sample locations.
+        probe = vtk.vtkProbeFilter()
+        probe.SetInputData(samples_pd)
+        probe.SetSourceData(grid)
+        probe.Update()
+        sampled = pv.wrap(probe.GetOutput())
+        sample_field = sampled.point_data["field"]
+        averaged_field = np.mean(sample_field.reshape(-1, len(offsets)), axis=1)
+
+        # Assign the averaged field to the mesh.
+        stl_mesh["field"] = averaged_field
+        stl_mesh.save(output_filename)
+    else:
+        # Original method: use vtkProbeFilter on the STL geometry.
+        stl_vtk = stl_mesh.extract_geometry()
+        probe = vtk.vtkProbeFilter()
+        probe.SetInputData(stl_vtk)
+        probe.SetSourceData(grid)
+        probe.Update()
+        stl_mapped = pv.wrap(probe.GetOutput())
+        stl_mapped.save(output_filename)
+
+    print(f"Saved {output_filename} in {time() - start:.6f} seconds.")
 
 def save_BCs_vtk(timestep, BCs, gridInfo, output_dir="."):
     """
@@ -408,7 +575,7 @@ def voxelize_stl_open3d(stl_filename, length_lbm_unit):
 
 
 @partial(jit)
-def q_criterion(u):
+def q_criterion(u, omega=2.0):
     # Compute derivatives
     u_x = u[0, ...]
     u_y = u[1, ...]
@@ -442,6 +609,18 @@ def q_criterion(u):
     s_2_1 = s_1_2
     s_2_2 = u_z_dz
     s_dot_s = s_0_0**2 + s_0_1**2 + s_0_2**2 + s_1_0**2 + s_1_1**2 + s_1_2**2 + s_2_0**2 + s_2_1**2 + s_2_2**2
+    
+    # Compute Viscosity from Omega
+    mu = ((1 / omega) - 0.5) / 3.
+    
+    # Compute shear stress components
+    tau_xy = 2 * mu * s_0_1
+    tau_xz = 2 * mu * s_0_2
+    tau_yz = 2 * mu * s_1_2
+
+    
+    # Compute shear stress magnitude
+    tau_magnitude = jnp.sqrt(tau_xy**2 + tau_xz**2 + tau_yz**2)
 
     # Compute omega
     omega_0_0 = 0.0
@@ -459,5 +638,14 @@ def q_criterion(u):
 
     # Compute q-criterion
     q = 0.5 * (omega_dot_omega - s_dot_s)
+    
+    # Pad outputs to match original shape
+    pad_width = ((1, 1), (1, 1), (1, 1))  # Add 1 voxel on each side in x, y, z
+    norm_mu = jnp.pad(norm_mu, pad_width, mode='constant', constant_values=0)
+    q = jnp.pad(q, pad_width, mode='constant', constant_values=0)
+    tau_xy = jnp.pad(tau_xy, pad_width, mode='constant', constant_values=0)
+    tau_xz = jnp.pad(tau_xz, pad_width, mode='constant', constant_values=0)
+    tau_yz = jnp.pad(tau_yz, pad_width, mode='constant', constant_values=0)
+    tau_magnitude = jnp.pad(tau_magnitude, pad_width, mode='constant', constant_values=0)
 
-    return norm_mu, q
+    return norm_mu, q, tau_xy, tau_xz, tau_yz, tau_magnitude
