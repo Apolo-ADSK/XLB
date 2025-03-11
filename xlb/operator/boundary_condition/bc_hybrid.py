@@ -105,7 +105,7 @@ class HybridBC(BoundaryCondition):
 
             @wp.func
             def prescribed_profile_warp(index: wp.vec3i, time: Any):
-                return wp.vec3(prescribed_value[0], prescribed_value[1], prescribed_value[2])
+                return prescribed_value
 
             self.profile = prescribed_profile_warp
 
