@@ -1,5 +1,5 @@
 """
-KBC collision operator for LBM.
+KBC collision operator for LBM with fused scalar products optimization.
 """
 
 import jax.numpy as jnp
@@ -19,7 +19,8 @@ class KBC(Collision):
     """
     KBC collision operator for LBM.
 
-    This class implements the Karlin-Bösch-Chikatamarla (KBC) model for the collision step in the Lattice Boltzmann Method.
+    This class implements the Karlin-Bösch-Chikatamarla (KBC) model for the collision step in the Lattice Boltzmann Method,
+    optimized with fused scalar products to reduce redundant division operations.
     """
 
     def __init__(
@@ -28,14 +29,17 @@ class KBC(Collision):
         precision_policy=None,
         compute_backend=None,
     ):
+        """Initialize the KBC collision operator."""
         self.momentum_flux = MomentumFlux()
-        self.epsilon = 1e-32
+        self.epsilon = 1e-32  # Small constant to prevent division by zero
 
         super().__init__(
             velocity_set=velocity_set,
             precision_policy=precision_policy,
             compute_backend=compute_backend,
         )
+
+    ### JAX Backend Implementation ###
 
     @Operator.register_backend(ComputeBackend.JAX)
     @partial(jit, static_argnums=(0,), donate_argnums=(1, 2, 3))
@@ -48,18 +52,25 @@ class KBC(Collision):
         omega,
     ):
         """
-        KBC collision step for lattice.
+        JAX implementation of the KBC collision step with fused scalar products.
 
         Parameters
         ----------
-        f : jax.numpy.array
+        f : jax.numpy.ndarray
             Distribution function.
-        feq : jax.numpy.array
+        feq : jax.numpy.ndarray
             Equilibrium distribution function.
-        rho : jax.numpy.array
+        rho : jax.numpy.ndarray
             Density.
-        u : jax.numpy.array
+        u : jax.numpy.ndarray
             Velocity.
+        omega : float
+            Relaxation parameter (inverse relaxation time).
+
+        Returns
+        -------
+        jax.numpy.ndarray
+            Post-collision distribution function.
         """
         fneq = f - feq
         if isinstance(self.velocity_set, D2Q9):
@@ -69,38 +80,52 @@ class KBC(Collision):
             shear = self.decompose_shear_d3q27_jax(fneq)
             delta_s = shear * rho
         else:
-            raise NotImplementedError("Velocity set not supported: {}".format(type(self.velocity_set)))
+            raise NotImplementedError(f"Velocity set not supported: {type(self.velocity_set)}")
 
-        # Compute required constants based on the input omega (omega is the inverse relaxation time)
+        # Compute constants
         beta = self.compute_dtype(0.5) * self.compute_dtype(omega)
         inv_beta = 1.0 / beta
 
-        # Perform collision
+        # Compute fused scalar products and perform collision
         delta_h = fneq - delta_s
-        gamma = inv_beta - (2.0 - inv_beta) * self.entropic_scalar_product(delta_s, delta_h, feq) / (
-            self.epsilon + self.entropic_scalar_product(delta_h, delta_h, feq)
-        )
-
+        sp1, sp2 = self.compute_scalar_products_jax(delta_s, delta_h, feq)
+        gamma = inv_beta - (2.0 - inv_beta) * sp1 / (self.epsilon + sp2)
         fout = f - beta * (2.0 * delta_s + gamma[None, ...] * delta_h)
 
         return fout
 
     @partial(jit, static_argnums=(0,), inline=True)
-    def entropic_scalar_product(self, x: jnp.ndarray, y: jnp.ndarray, feq: jnp.ndarray):
+    def compute_scalar_products_jax(self, delta_s, delta_h, feq):
         """
-        Compute the entropic scalar product of x and y to approximate gamma in KBC.
+        Compute fused entropic scalar products for JAX backend.
+
+        Reuses the term `delta_h / feq` to compute both scalar products efficiently.
+
+        Parameters
+        ----------
+        delta_s : jax.numpy.ndarray
+            Shear component of the non-equilibrium distribution.
+        delta_h : jax.numpy.ndarray
+            Higher-order component of the non-equilibrium distribution.
+        feq : jax.numpy.ndarray
+            Equilibrium distribution function.
 
         Returns
         -------
-        jax.numpy.array
-            Entropic scalar product of x, y, and feq.
+        tuple
+            (sp1, sp2) where:
+            - sp1 = sum(delta_s * delta_h / feq)
+            - sp2 = sum(delta_h * delta_h / feq)
         """
-        return jnp.sum(x * y / feq, axis=0)
+        temp = delta_h / feq
+        sp1 = jnp.sum(delta_s * temp, axis=0)
+        sp2 = jnp.sum(delta_h * temp, axis=0)
+        return sp1, sp2
 
     @partial(jit, static_argnums=(0,), inline=True)
     def decompose_shear_d3q27_jax(self, fneq):
         """
-        Decompose fneq into shear components for D3Q27 lattice.
+        Decompose the non-equilibrium distribution into shear components for D3Q27.
 
         Parameters
         ----------
@@ -110,16 +135,11 @@ class KBC(Collision):
         Returns
         -------
         jax.numpy.ndarray
-            Shear components of fneq.
+            Shear components.
         """
-
-        # Calculate the momentum flux
         Pi = self.momentum_flux(fneq)
-        # Calculating Nxz and Nyz with indices moved to the first dimension
         Nxz = Pi[0, ...] - Pi[5, ...]
         Nyz = Pi[3, ...] - Pi[5, ...]
-
-        # For c = (i, 0, 0), c = (0, j, 0) and c = (0, 0, k)
         s = jnp.zeros_like(fneq)
         s = s.at[9, ...].set((2.0 * Nxz - Nyz) / 6.0)
         s = s.at[18, ...].set((2.0 * Nxz - Nyz) / 6.0)
@@ -127,41 +147,34 @@ class KBC(Collision):
         s = s.at[6, ...].set((-Nxz + 2.0 * Nyz) / 6.0)
         s = s.at[1, ...].set((-Nxz - Nyz) / 6.0)
         s = s.at[2, ...].set((-Nxz - Nyz) / 6.0)
-
-        # For c = (i, j, 0)
         s = s.at[12, ...].set(Pi[1, ...] / 4.0)
         s = s.at[24, ...].set(Pi[1, ...] / 4.0)
         s = s.at[21, ...].set(-Pi[1, ...] / 4.0)
         s = s.at[15, ...].set(-Pi[1, ...] / 4.0)
-
-        # For c = (i, 0, k)
         s = s.at[10, ...].set(Pi[2, ...] / 4.0)
         s = s.at[20, ...].set(Pi[2, ...] / 4.0)
         s = s.at[19, ...].set(-Pi[2, ...] / 4.0)
         s = s.at[11, ...].set(-Pi[2, ...] / 4.0)
-
-        # For c = (0, j, k)
         s = s.at[8, ...].set(Pi[4, ...] / 4.0)
         s = s.at[4, ...].set(Pi[4, ...] / 4.0)
         s = s.at[7, ...].set(-Pi[4, ...] / 4.0)
         s = s.at[5, ...].set(-Pi[4, ...] / 4.0)
-
         return s
 
     @partial(jit, static_argnums=(0,), inline=True)
     def decompose_shear_d2q9_jax(self, fneq):
         """
-        Decompose fneq into shear components for D2Q9 lattice.
+        Decompose the non-equilibrium distribution into shear components for D2Q9.
 
         Parameters
         ----------
-        fneq : jax.numpy.array
+        fneq : jax.numpy.ndarray
             Non-equilibrium distribution function.
 
         Returns
         -------
-        jax.numpy.array
-            Shear components of fneq.
+        jax.numpy.ndarray
+            Shear components.
         """
         Pi = self.momentum_flux(fneq)
         N = Pi[0, ...] - Pi[2, ...]
@@ -174,21 +187,24 @@ class KBC(Collision):
         s = s.at[4, ...].set(-Pi[1, ...])
         s = s.at[5, ...].set(-Pi[1, ...])
         s = s.at[7, ...].set(Pi[1, ...])
-
         return s
 
-    def _construct_warp(self):
-        # Raise error if velocity set is not supported
-        if not (isinstance(self.velocity_set, D3Q27) or isinstance(self.velocity_set, D2Q9)):
-            raise NotImplementedError("Velocity set not supported for warp backend: {}".format(type(self.velocity_set)))
+    ### Warp Backend Implementation ###
 
-        # Set local constants TODO: This is a hack and should be fixed with warp update
+    def _construct_warp(self):
+        """Construct Warp functionals and kernel for the KBC collision step."""
+        if not (isinstance(self.velocity_set, D3Q27) or isinstance(self.velocity_set, D2Q9)):
+            raise NotImplementedError(f"Velocity set not supported for Warp backend: {type(self.velocity_set)}")
+
+        # Define Warp types and constants
         _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
         _f_vec = wp.vec(self.velocity_set.q, dtype=self.compute_dtype)
         _epsilon = wp.constant(self.compute_dtype(self.epsilon))
+        _two = wp.constant(self.compute_dtype(2.0))
 
         @wp.func
         def decompose_shear_d2q9(fneq: Any):
+            """Decompose shear components for D2Q9 in Warp."""
             pi = self.momentum_flux.warp_functional(fneq)
             N = pi[0] - pi[2]
             s = _f_vec()
@@ -202,65 +218,81 @@ class KBC(Collision):
             s[7] = pi[1]
             return s
 
-        # Construct functional for decomposing shear
         @wp.func
-        def decompose_shear_d3q27(
-            fneq: Any,
-        ):
-            # Get momentum flux
+        def decompose_shear_d3q27(fneq: Any):
+            """Decompose shear components for D3Q27 in Warp."""
             pi = self.momentum_flux.warp_functional(fneq)
             nxz = pi[0] - pi[5]
             nyz = pi[3] - pi[5]
-
-            # set shear components
             s = _f_vec()
-
-            # For c = (i, 0, 0), c = (0, j, 0) and c = (0, 0, k)
-            two = self.compute_dtype(2.0)
-            four = self.compute_dtype(4.0)
-            six = self.compute_dtype(6.0)
-
-            s[9] = (two * nxz - nyz) / six
-            s[18] = (two * nxz - nyz) / six
-            s[3] = (-nxz + two * nyz) / six
-            s[6] = (-nxz + two * nyz) / six
-            s[1] = (-nxz - nyz) / six
-            s[2] = (-nxz - nyz) / six
-
-            # For c = (i, j, 0)
-            s[12] = pi[1] / four
-            s[24] = pi[1] / four
-            s[21] = -pi[1] / four
-            s[15] = -pi[1] / four
-
-            # For c = (i, 0, k)
-            s[10] = pi[2] / four
-            s[20] = pi[2] / four
-            s[19] = -pi[2] / four
-            s[11] = -pi[2] / four
-
-            # For c = (0, j, k)
-            s[8] = pi[4] / four
-            s[4] = pi[4] / four
-            s[7] = -pi[4] / four
-            s[5] = -pi[4] / four
-
+            s[9] = (_two * nxz - nyz) / 6.0
+            s[18] = (_two * nxz - nyz) / 6.0
+            s[3] = (-nxz + _two * nyz) / 6.0
+            s[6] = (-nxz + _two * nyz) / 6.0
+            s[1] = (-nxz - nyz) / 6.0
+            s[2] = (-nxz - nyz) / 6.0
+            s[12] = pi[1] / 4.0
+            s[24] = pi[1] / 4.0
+            s[21] = -pi[1] / 4.0
+            s[15] = -pi[1] / 4.0
+            s[10] = pi[2] / 4.0
+            s[20] = pi[2] / 4.0
+            s[19] = -pi[2] / 4.0
+            s[11] = -pi[2] / 4.0
+            s[8] = pi[4] / 4.0
+            s[4] = pi[4] / 4.0
+            s[7] = -pi[4] / 4.0
+            s[5] = -pi[4] / 4.0
             return s
 
-        # Construct functional for computing entropic scalar product
         @wp.func
-        def entropic_scalar_product(
-            x: Any,
-            y: Any,
-            feq: Any,
-        ):
-            e = wp.cw_div(wp.cw_mul(x, y), feq)
-            e_sum = self.compute_dtype(0.0)
-            for i in range(self.velocity_set.q):
-                e_sum += e[i]
-            return e_sum
+        def compute_scalar_products(delta_s: Any, delta_h: Any, feq: Any):
+            """
+            Compute fused entropic scalar products for Warp backend.
 
-        # Construct the functional
+            Reuses `delta_h[i] / feq[i]` to compute both scalar products in a single loop.
+
+            Parameters
+            ----------
+            delta_s : Warp vector
+                Shear component.
+            delta_h : Warp vector
+                Higher-order component.
+            feq : Warp vector
+                Equilibrium distribution function.
+
+            Returns
+            -------
+            tuple
+                (sp1, sp2) where:
+                - sp1 = sum(delta_s * delta_h / feq)
+                - sp2 = sum(delta_h * delta_h / feq)
+            """
+            s1 = 0.0  # Sum for sp1
+            c1 = 0.0  # Correction for sp1
+            s2 = 0.0  # Sum for sp2
+            c2 = 0.0  # Correction for sp2
+            for i in range(self.velocity_set.q):
+                temp = delta_h[i] / feq[i]
+                x1 = delta_s[i] * temp
+                t1 = s1 + x1
+                if abs(s1) >= abs(x1):
+                    c1 += (s1 - t1) + x1
+                else:
+                    c1 += (x1 - t1) + s1
+                s1 = t1
+
+                x2 = delta_h[i] * temp
+                t2 = s2 + x2
+                if abs(s2) >= abs(x2):
+                    c2 += (s2 - t2) + x2
+                else:
+                    c2 += (x2 - t2) + s2
+                s2 = t2
+            sp1 = s1 + c1
+            sp2 = s2 + c2
+            return sp1, sp2
+
         @wp.func
         def functional(
             f: Any,
@@ -269,30 +301,23 @@ class KBC(Collision):
             u: Any,
             omega: Any,
         ):
-            # Compute shear and delta_s
+            """Warp functional for KBC collision with fused scalar products."""
             fneq = f - feq
             if wp.static(self.velocity_set.d == 3):
                 shear = decompose_shear_d3q27(fneq)
                 delta_s = shear * rho
             else:
                 shear = decompose_shear_d2q9(fneq)
-                delta_s = shear * rho / self.compute_dtype(4.0)
+                delta_s = shear * rho / 4.0
 
-            # Compute required constants based on the input omega (omega is the inverse relaxation time)
             _beta = self.compute_dtype(0.5) * self.compute_dtype(omega)
             _inv_beta = self.compute_dtype(1.0) / _beta
-
-            # Perform collision
             delta_h = fneq - delta_s
-            two = self.compute_dtype(2.0)
-            gamma = _inv_beta - (two - _inv_beta) * entropic_scalar_product(delta_s, delta_h, feq) / (
-                _epsilon + entropic_scalar_product(delta_h, delta_h, feq)
-            )
-            fout = f - _beta * (two * delta_s + gamma * delta_h)
-
+            sp1, sp2 = compute_scalar_products(delta_s, delta_h, feq)
+            gamma = _inv_beta - (_two - _inv_beta) * sp1 / (_epsilon + sp2)
+            fout = f - _beta * (_two * delta_s + gamma * delta_h)
             return fout
 
-        # Construct the warp kernel
         @wp.kernel
         def kernel(
             f: wp.array4d(dtype=Any),
@@ -302,26 +327,19 @@ class KBC(Collision):
             u: wp.array4d(dtype=Any),
             omega: Any,
         ):
-            # Get the global index
+            """Warp kernel to launch the KBC collision step."""
             i, j, k = wp.tid()
-            index = wp.vec3i(i, j, k)  # TODO: Warp needs to fix this
-
-            # Load needed values
+            index = wp.vec3i(i, j, k)
             _f = _f_vec()
             _feq = _f_vec()
-            _d = self.velocity_set.d
             for l in range(self.velocity_set.q):
                 _f[l] = f[l, index[0], index[1], index[2]]
                 _feq[l] = feq[l, index[0], index[1], index[2]]
             _u = _u_vec()
-            for l in range(_d):
+            for l in range(self.velocity_set.d):
                 _u[l] = u[l, index[0], index[1], index[2]]
             _rho = rho[0, index[0], index[1], index[2]]
-
-            # Compute the collision
             _fout = functional(_f, _feq, _rho, _u, omega)
-
-            # Write the result
             for l in range(self.velocity_set.q):
                 fout[l, index[0], index[1], index[2]] = self.store_dtype(_fout[l])
 
@@ -329,17 +347,22 @@ class KBC(Collision):
 
     @Operator.register_backend(ComputeBackend.WARP)
     def warp_implementation(self, f, feq, fout, rho, u, omega):
-        # Launch the warp kernel
+        """
+        Warp implementation of the KBC collision step.
+
+        Parameters
+        ----------
+        f, feq, fout, rho, u, omega : Warp arrays and scalar
+            Inputs and output for the collision step.
+
+        Returns
+        -------
+        Warp array
+            Post-collision distribution function.
+        """
         wp.launch(
             self.warp_kernel,
-            inputs=[
-                f,
-                feq,
-                fout,
-                rho,
-                u,
-                omega,
-            ],
+            inputs=[f, feq, fout, rho, u, omega],
             dim=f.shape[1:],
         )
         return fout
