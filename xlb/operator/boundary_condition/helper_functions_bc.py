@@ -121,18 +121,65 @@ class HelperFunctionsBC(object):
             f_neq = fpop - feq
             PiNeq = momentum_flux.warp_functional(f_neq)
             nt = _d * (_d + 1) // 2
+
             for l in range(_q):
+                # Unroll small nt loops manually for known _d
                 QiPi1 = zero
                 correction = zero
-                for t in range(nt):
-                    val = _qi[l, t] * PiNeq[t]
+                if _d == 2:  # nt = 3
+                    val0 = _qi[l, 0] * PiNeq[0]
+                    QiPi1 = QiPi1 + val0
+                    correction = correction + (val0 - (QiPi1 - zero))
+                    
+                    val1 = _qi[l, 1] * PiNeq[1]
                     old_QiPi1 = QiPi1
-                    QiPi1 = QiPi1 + val
-                    correction = correction + (val - (QiPi1 - old_QiPi1))
+                    QiPi1 = QiPi1 + val1
+                    correction = correction + (val1 - (QiPi1 - old_QiPi1))
+                    
+                    val2 = _qi[l, 2] * PiNeq[2]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val2
+                    correction = correction + (val2 - (QiPi1 - old_QiPi1))
+                elif _d == 3:  # nt = 6
+                    val0 = _qi[l, 0] * PiNeq[0]
+                    QiPi1 = QiPi1 + val0
+                    correction = correction + (val0 - (QiPi1 - zero))
+                    
+                    val1 = _qi[l, 1] * PiNeq[1]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val1
+                    correction = correction + (val1 - (QiPi1 - old_QiPi1))
+                    
+                    val2 = _qi[l, 2] * PiNeq[2]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val2
+                    correction = correction + (val2 - (QiPi1 - old_QiPi1))
+                    
+                    val3 = _qi[l, 3] * PiNeq[3]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val3
+                    correction = correction + (val3 - (QiPi1 - old_QiPi1))
+                    
+                    val4 = _qi[l, 4] * PiNeq[4]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val4
+                    correction = correction + (val4 - (QiPi1 - old_QiPi1))
+                    
+                    val5 = _qi[l, 5] * PiNeq[5]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val5
+                    correction = correction + (val5 - (QiPi1 - old_QiPi1))
+                else:
+                    for t in range(nt):
+                        val = _qi[l, t] * PiNeq[t]
+                        old_QiPi1 = QiPi1
+                        QiPi1 = QiPi1 + val
+                        correction = correction + (val - (QiPi1 - old_QiPi1))
+
                 QiPi1 = QiPi1 + correction
                 fpop1 = fourPointfive * _w[l] * QiPi1 * scale
-                #fpop1 = wp.clamp(fpop1, -compute_dtype(0.1), compute_dtype(0.1))
                 fpop[l] = feq[l] + fpop1
+
             return fpop
 
         @wp.func

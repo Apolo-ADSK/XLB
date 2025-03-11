@@ -37,41 +37,56 @@ class QuadraticEquilibrium(Equilibrium):
             rho: Any,
             u: Any,
         ):
-            # Allocate the equilibrium
             feq = _f_vec()
-            zero =self.compute_dtype(0.0)
+            zero = self.compute_dtype(0.0)
             half = self.compute_dtype(0.5)
             one = self.compute_dtype(1.0)
             one_half = self.compute_dtype(1.5)
             three = self.compute_dtype(3.0)
 
-            # Compute the equilibrium
             for l in range(self.velocity_set.q):
-                # Compute cu using Neumaier summation for improved stability.
-                cu = zero
-                comp = zero
+                # Use wp.vec3 for D3 (adjust to wp.vec2 or wp.vec4 based on your velocity_set.d)
+                cu_vec = wp.vec3(zero, zero, zero)
+                comp_vec = wp.vec3(zero, zero, zero)
+
+                # Precompute the terms into a vector to avoid conditionals in the loop
+                x_vec = wp.vec3(zero, zero, zero)
                 for d in range(self.velocity_set.d):
                     if _c[d, l] == 1:
-                        x = u[d]
+                        x_vec[d] = u[d]
                     elif _c[d, l] == -1:
-                        x = -u[d]
+                        x_vec[d] = -u[d]
                     else:
-                        x = zero
-                    temp = cu + x
-                    # Compensate for the lost low-order bits
-                    if wp.abs(cu) >= wp.abs(x):
-                        comp += ((cu - temp) + x)
+                        x_vec[d] = zero
+
+                # SIMD Kahan summation (single step for all components)
+                temp_vec = cu_vec + x_vec
+                # Compute compensation component-wise without direct vector comparison
+                for d in range(self.velocity_set.d):
+                    cu_d = wp.extract(cu_vec, d)
+                    x_d = wp.extract(x_vec, d)
+                    temp_d = wp.extract(temp_vec, d)
+                    if wp.abs(cu_d) >= wp.abs(x_d):
+                        comp_vec[d] = wp.extract(comp_vec, d) + ((cu_d - temp_d) + x_d)
                     else:
-                        comp += ((x - temp) + cu)
-                    cu = temp
-                cu = cu + comp
+                        comp_vec[d] = wp.extract(comp_vec, d) + ((x_d - temp_d) + cu_d)
+                cu_vec = temp_vec
+
+                # Apply correction
+                cu_vec = cu_vec + comp_vec
+
+                # Extract scalar cu
+                cu = zero
+                for d in range(self.velocity_set.d):
+                    cu += wp.extract(cu_vec, d)
                 cu *= three
 
-                # Compute usqr using wp.dot (u has a small dimension so this is acceptable)
                 usqr = one_half * wp.dot(u, u)
-
-                # Compute feq for the current population index
-                feq[l] = rho * _w[l] * (one + cu * (one + half * cu) - usqr )
+                feq[l] = rho * _w[l] * (
+                    one
+                    + cu * (one + half * cu)
+                    - usqr
+                )
 
             return feq
         
