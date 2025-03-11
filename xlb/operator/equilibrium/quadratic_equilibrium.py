@@ -39,26 +39,42 @@ class QuadraticEquilibrium(Equilibrium):
         ):
             # Allocate the equilibrium
             feq = _f_vec()
+            zero =self.compute_dtype(0.0)
+            half = self.compute_dtype(0.5)
+            one = self.compute_dtype(1.0)
+            one_half = self.compute_dtype(1.5)
+            three = self.compute_dtype(3.0)
 
             # Compute the equilibrium
             for l in range(self.velocity_set.q):
-                # Compute cu
-                cu = self.compute_dtype(0.0)
+                # Compute cu using Neumaier summation for improved stability.
+                cu = zero
+                comp = zero
                 for d in range(self.velocity_set.d):
                     if _c[d, l] == 1:
-                        cu += u[d]
+                        x = u[d]
                     elif _c[d, l] == -1:
-                        cu -= u[d]
-                cu *= self.compute_dtype(3.0)
+                        x = -u[d]
+                    else:
+                        x = zero
+                    temp = cu + x
+                    # Compensate for the lost low-order bits
+                    if wp.abs(cu) >= wp.abs(x):
+                        comp += ((cu - temp) + x)
+                    else:
+                        comp += ((x - temp) + cu)
+                    cu = temp
+                cu = cu + comp
+                cu *= three
 
-                # Compute usqr
-                usqr = self.compute_dtype(1.5) * wp.dot(u, u)
+                # Compute usqr using wp.dot (u has a small dimension so this is acceptable)
+                usqr = one_half * wp.dot(u, u)
 
-                # Compute feq
-                feq[l] = rho * _w[l] * (self.compute_dtype(1.0) + cu * (self.compute_dtype(1.0) + self.compute_dtype(0.5) * cu) - usqr)
+                # Compute feq for the current population index
+                feq[l] = rho * _w[l] * (one + cu * (one + half * cu) - usqr )
 
             return feq
-
+        
         # Construct the warp kernel
         @wp.kernel
         def kernel(

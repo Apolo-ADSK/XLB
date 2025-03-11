@@ -537,9 +537,101 @@ class MeshBoundaryMasker(Operator):
                     # Set the boundary id and missing_mask
                     bc_mask[0, index[0], index[1], index[2]] = wp.uint8(id_number)
                     missing_mask[_opp_indices[l], index[0], index[1], index[2]] = True
-
+       
         @wp.kernel
         def kernel_ray_with_distance(
+            mesh_id: wp.uint64,
+            id_number: wp.int32,
+            f_0: wp.array4d(dtype=Any),
+            f_1: wp.array4d(dtype=Any),
+            bc_mask: wp.array4d(dtype=wp.uint8),
+            missing_mask: wp.array4d(dtype=wp.bool),
+            solid_mask: wp.array3d(dtype=wp.uint8),
+        ):
+            # get index
+            i, j, k = wp.tid()
+
+            # Get local indices
+            index = wp.vec3i(i, j, k)
+
+            # position of the point
+            pos_bc_cell = index_to_position(index)
+            epsilon = 1e-4
+
+            # Find the fractional distance to the mesh in each direction
+            for l in range(1, _q):
+                _dir = wp.vec3f(wp.float32(_c[0, l]), wp.float32(_c[1, l]), wp.float32(_c[2, l]))
+                # Max length depends on ray direction (diagonals are longer)
+                max_length = wp.length(_dir)
+                dir_norm = _dir / max_length
+
+                # Define ray origins:
+                pos_center   = pos_bc_cell
+                pos_forward  = pos_bc_cell + epsilon * dir_norm
+                pos_backward = pos_bc_cell - epsilon * dir_norm
+
+                # Cast ray from cell center.
+                query0 = wp.mesh_query_ray(mesh_id, pos_center, dir_norm, max_length)
+                hit0 = query0.result
+                effective0 = max_length
+                if hit0:
+                    pos_mesh0 = wp.mesh_eval_position(mesh_id, query0.face, query0.u, query0.v)
+                    effective0 = wp.length(pos_mesh0 - pos_center)
+
+                # Cast ray from forward-shifted origin.
+                # We shorten the maximum length by epsilon so that this ray does not overshoot the central result.
+                query1 = wp.mesh_query_ray(mesh_id, pos_forward, dir_norm, max_length - epsilon)
+                hit1 = query1.result
+                effective1 = max_length
+                if hit1:
+                    pos_mesh1 = wp.mesh_eval_position(mesh_id, query1.face, query1.u, query1.v)
+                    # The measured distance is from pos_forward; add epsilon to get the distance from cell center.
+                    effective1 = wp.length(pos_mesh1 - pos_forward) + epsilon
+                    # If the central ray hit, clip the forward result to not exceed it.
+                    if hit0:
+                        effective1 = wp.min(effective1, effective0)
+
+                # Cast ray from backward-shifted origin.
+                # We extend the maximum length by epsilon to accommodate the backward offset.
+                query2 = wp.mesh_query_ray(mesh_id, pos_backward, dir_norm, max_length + epsilon)
+                hit2 = query2.result
+                effective2 = max_length
+                if hit2:
+                    pos_mesh2 = wp.mesh_eval_position(mesh_id, query2.face, query2.u, query2.v)
+                    # Add epsilon to account for the backward shift.
+                    effective2 = wp.length(pos_mesh2 - pos_backward) + epsilon
+
+                # If any ray returned a hit, mark the voxel as a boundary.
+                if hit0 or hit1 or hit2:
+                    bc_mask[0, index[0], index[1], index[2]] = wp.uint8(id_number)
+                    missing_mask[_opp_indices[l], index[0], index[1], index[2]] = True
+
+                # Average the effective distances from rays that hit.
+                sum_effective = 0.0
+                count = 0.0
+                if hit0:
+                    sum_effective += effective0
+                    count += 1.0
+                if hit1:
+                    sum_effective += effective1
+                    count += 1.0
+                if hit2:
+                    sum_effective += effective2
+                    count += 1.0
+
+                # If none hit, default to the full length.
+                avg_effective = max_length
+                if count > 0.0:
+                    avg_effective = sum_effective / count
+
+                # Compute the normalized weight (fraction of max_length).
+                weight = avg_effective / max_length
+                weight = wp.round(weight * 100.0) / 100.0
+                f_1[l, index[0], index[1], index[2]] = self.store_dtype(weight)
+
+
+        @wp.kernel
+        def kernel_ray_with_distance2(
             mesh_id: wp.uint64,
             id_number: wp.int32,
             f_0: wp.array4d(dtype=Any),

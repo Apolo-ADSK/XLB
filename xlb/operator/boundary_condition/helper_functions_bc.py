@@ -112,20 +112,26 @@ class HelperFunctionsBC(object):
             """
             Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
             """
-            # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
+            rho, u = macroscopic.warp_functional(fpop)
+            u_mag = wp.length(u)
+            threshold = compute_dtype(0.001)
+            scale = wp.min(compute_dtype(1.0), u_mag / threshold)
+            zero = compute_dtype(0.0)
+            fourPointfive = compute_dtype(4.5)
             f_neq = fpop - feq
             PiNeq = momentum_flux.warp_functional(f_neq)
-
-            # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)
             nt = _d * (_d + 1) // 2
             for l in range(_q):
-                QiPi1 = compute_dtype(0.0)
+                QiPi1 = zero
+                correction = zero
                 for t in range(nt):
-                    QiPi1 += _qi[l, t] * PiNeq[t]
-
-                # assign all populations based on eq 45 of Latt et al (2008)
-                # fneq ~ f^1
-                fpop1 = compute_dtype(4.5) * _w[l] * QiPi1
+                    val = _qi[l, t] * PiNeq[t]
+                    old_QiPi1 = QiPi1
+                    QiPi1 = QiPi1 + val
+                    correction = correction + (val - (QiPi1 - old_QiPi1))
+                QiPi1 = QiPi1 + correction
+                fpop1 = fourPointfive * _w[l] * QiPi1 * scale
+                #fpop1 = wp.clamp(fpop1, -compute_dtype(0.1), compute_dtype(0.1))
                 fpop[l] = feq[l] + fpop1
             return fpop
 
