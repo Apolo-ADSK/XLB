@@ -556,7 +556,6 @@ class MeshBoundaryMasker(Operator):
 
             # position of the point
             pos_bc_cell = index_to_position(index)
-            epsilon = 1e-4
 
             # Find the fractional distance to the mesh in each direction
             for l in range(1, _q):
@@ -564,6 +563,7 @@ class MeshBoundaryMasker(Operator):
                 # Max length depends on ray direction (diagonals are longer)
                 max_length = wp.length(_dir)
                 dir_norm = _dir / max_length
+                epsilon = 0.00005 * max_length
 
                 # Define ray origins:
                 pos_center   = pos_bc_cell
