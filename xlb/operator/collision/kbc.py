@@ -1,7 +1,3 @@
-"""
-KBC collision operator for LBM with fused scalar products optimization.
-"""
-
 import jax.numpy as jnp
 from jax import jit
 import warp as wp
