@@ -264,10 +264,10 @@ class KBC(Collision):
                 - sp1 = sum(delta_s * delta_h / feq)
                 - sp2 = sum(delta_h * delta_h / feq)
             """
-            s1 = 0.0  # Sum for sp1
-            c1 = 0.0  # Correction for sp1
-            s2 = 0.0  # Sum for sp2
-            c2 = 0.0  # Correction for sp2
+            s1 = self.compute_dtype(0.0)  # Sum for sp1
+            c1 = self.compute_dtype(0.0)  # Correction for sp1
+            s2 = self.compute_dtype(0.0) # Sum for sp2
+            c2 = self.compute_dtype(0.0)  # Correction for sp2
             for i in range(self.velocity_set.q):
                 temp = delta_h[i] / feq[i]
                 x1 = delta_s[i] * temp
@@ -276,7 +276,7 @@ class KBC(Collision):
                     c1 += (s1 - t1) + x1
                 else:
                     c1 += (x1 - t1) + s1
-                s1 = t1
+                
 
                 x2 = delta_h[i] * temp
                 t2 = s2 + x2
@@ -284,9 +284,9 @@ class KBC(Collision):
                     c2 += (s2 - t2) + x2
                 else:
                     c2 += (x2 - t2) + s2
-                s2 = t2
-            sp1 = s1 + c1
-            sp2 = s2 + c2
+                
+            sp1 = t1 + c1
+            sp2 = t2 + c2
             return sp1, sp2
 
         @wp.func
