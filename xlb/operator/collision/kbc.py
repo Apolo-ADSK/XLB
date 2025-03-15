@@ -1,3 +1,7 @@
+"""
+KBC collision operator for LBM with Neumaier summation and fused scalar products.
+"""
+
 import jax.numpy as jnp
 from jax import jit
 import warp as wp
@@ -16,7 +20,7 @@ class KBC(Collision):
     KBC collision operator for LBM.
 
     This class implements the Karlin-Bösch-Chikatamarla (KBC) model for the collision step in the Lattice Boltzmann Method,
-    optimized with fused scalar products to reduce redundant division operations.
+    optimized with fused scalar products and Neumaier summation for numerical stability.
     """
 
     def __init__(
@@ -48,7 +52,7 @@ class KBC(Collision):
         omega,
     ):
         """
-        JAX implementation of the KBC collision step with fused scalar products.
+        JAX implementation of the KBC collision step with fused scalar products and Neumaier summation.
 
         Parameters
         ----------
@@ -82,7 +86,7 @@ class KBC(Collision):
         beta = self.compute_dtype(0.5) * self.compute_dtype(omega)
         inv_beta = 1.0 / beta
 
-        # Compute fused scalar products and perform collision
+        # Compute fused scalar products with Neumaier summation and perform collision
         delta_h = fneq - delta_s
         sp1, sp2 = self.compute_scalar_products_jax(delta_s, delta_h, feq)
         gamma = inv_beta - (2.0 - inv_beta) * sp1 / (self.epsilon + sp2)
@@ -93,7 +97,7 @@ class KBC(Collision):
     @partial(jit, static_argnums=(0,), inline=True)
     def compute_scalar_products_jax(self, delta_s, delta_h, feq):
         """
-        Compute fused entropic scalar products for JAX backend.
+        Compute fused entropic scalar products for JAX backend using Neumaier summation.
 
         Reuses the term `delta_h / feq` to compute both scalar products efficiently.
 
@@ -114,8 +118,27 @@ class KBC(Collision):
             - sp2 = sum(delta_h * delta_h / feq)
         """
         temp = delta_h / feq
-        sp1 = jnp.sum(delta_s * temp, axis=0)
-        sp2 = jnp.sum(delta_h * temp, axis=0)
+
+        # Neumaier summation for sp1
+        s1 = self.compute_dtype(0.0)
+        c1 = self.compute_dtype(0.0)
+        for i in range(self.velocity_set.q):
+            x1 = delta_s[i] * temp[i]
+            t1 = s1 + x1
+            c1 += jnp.where(jnp.abs(s1) >= jnp.abs(x1), x1 - (t1 - s1), (x1 + s1) - t1)
+            s1 = t1
+        sp1 = s1 + c1
+
+        # Neumaier summation for sp2
+        s2 = self.compute_dtype(0.0)
+        c2 = self.compute_dtype(0.0)
+        for i in range(self.velocity_set.q):
+            x2 = delta_h[i] * temp[i]
+            t2 = s2 + x2
+            c2 += jnp.where(jnp.abs(s2) >= jnp.abs(x2), x2 - (t2 - s2), (x2 + s2) - t2)
+            s2 = t2
+        sp2 = s2 + c2
+
         return sp1, sp2
 
     @partial(jit, static_argnums=(0,), inline=True)
@@ -244,9 +267,9 @@ class KBC(Collision):
         @wp.func
         def compute_scalar_products(delta_s: Any, delta_h: Any, feq: Any):
             """
-            Compute fused entropic scalar products for Warp backend.
+            Compute fused entropic scalar products for Warp backend using Neumaier summation.
 
-            Reuses `delta_h[i] / feq[i]` to compute both scalar products in a single loop.
+            Reuses `delta_h[i] / feq[i]` to compute both scalar products efficiently.
 
             Parameters
             ----------
@@ -264,29 +287,34 @@ class KBC(Collision):
                 - sp1 = sum(delta_s * delta_h / feq)
                 - sp2 = sum(delta_h * delta_h / feq)
             """
-            s1 = self.compute_dtype(0.0)  # Sum for sp1
-            c1 = self.compute_dtype(0.0)  # Correction for sp1
-            s2 = self.compute_dtype(0.0) # Sum for sp2
-            c2 = self.compute_dtype(0.0)  # Correction for sp2
+            # Neumaier summation for sp1
+            s1 = self.compute_dtype(0.0)
+            c1 = self.compute_dtype(0.0)
             for i in range(self.velocity_set.q):
                 temp = delta_h[i] / feq[i]
                 x1 = delta_s[i] * temp
                 t1 = s1 + x1
                 if abs(s1) >= abs(x1):
-                    c1 += (s1 - t1) + x1
+                    c1 += (x1 - (t1 - s1))
                 else:
-                    c1 += (x1 - t1) + s1
-                
+                    c1 += ((x1 + s1) - t1)
+                s1 = t1
 
+            # Neumaier summation for sp2
+            s2 = self.compute_dtype(0.0)
+            c2 = self.compute_dtype(0.0)
+            for i in range(self.velocity_set.q):
+                temp = delta_h[i] / feq[i]
                 x2 = delta_h[i] * temp
                 t2 = s2 + x2
                 if abs(s2) >= abs(x2):
-                    c2 += (s2 - t2) + x2
+                    c2 += (x2 - (t2 - s2))
                 else:
-                    c2 += (x2 - t2) + s2
-                
-            sp1 = t1 + c1
-            sp2 = t2 + c2
+                    c2 += ((x2 + s2) - t2)
+                s2 = t2
+
+            sp1 = s1 + c1
+            sp2 = s2 + c2
             return sp1, sp2
 
         @wp.func
@@ -297,7 +325,7 @@ class KBC(Collision):
             u: Any,
             omega: Any,
         ):
-            """Warp functional for KBC collision with fused scalar products."""
+            """Warp functional for KBC collision with fused scalar products and Neumaier summation."""
             fneq = f - feq
             if wp.static(self.velocity_set.d == 3):
                 shear = decompose_shear_d3q27(fneq)
