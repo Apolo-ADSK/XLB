@@ -29,7 +29,7 @@ class KBC(Collision):
         compute_backend=None,
     ):
         self.momentum_flux = MomentumFlux()
-        self.epsilon = 1e-32
+        self.epsilon = 1e-7
 
         super().__init__(
             velocity_set=velocity_set,
@@ -218,34 +218,40 @@ class KBC(Collision):
             s = _f_vec()
 
             # For c = (i, 0, 0), c = (0, j, 0) and c = (0, 0, k)
-            two = self.compute_dtype(2.0)
-            four = self.compute_dtype(4.0)
-            six = self.compute_dtype(6.0)
+            _two = self.compute_dtype(2.0)
+            _inv_four = self.compute_dtype(1.0/4.0)
+            _inv_six = self.compute_dtype(1.0/6.0)
+            shear1_inv6 = (_two * nxz - nyz) * _inv_six
+            shear2_inv6 = (-nxz + _two * nyz) * _inv_six
+            shear3_inv6 = (-nxz - nyz) * _inv_six
+            pi_invFour1 = pi[1] * _inv_four
+            pi_invFour2 = pi[2] * _inv_four
+            pi_invFour4 = pi[2] * _inv_four
 
-            s[9] = (two * nxz - nyz) / six
-            s[18] = (two * nxz - nyz) / six
-            s[3] = (-nxz + two * nyz) / six
-            s[6] = (-nxz + two * nyz) / six
-            s[1] = (-nxz - nyz) / six
-            s[2] = (-nxz - nyz) / six
+            s[9]  = shear1_inv6
+            s[18] = shear1_inv6
+            s[3]  = shear2_inv6
+            s[6]  = shear2_inv6
+            s[1]  = shear3_inv6
+            s[2]  = shear3_inv6
 
             # For c = (i, j, 0)
-            s[12] = pi[1] / four
-            s[24] = pi[1] / four
-            s[21] = -pi[1] / four
-            s[15] = -pi[1] / four
+            s[12] = pi_invFour1
+            s[24] = pi_invFour1
+            s[21] = -pi_invFour1
+            s[15] = -pi_invFour1
 
             # For c = (i, 0, k)
-            s[10] = pi[2] / four
-            s[20] = pi[2] / four
-            s[19] = -pi[2] / four
-            s[11] = -pi[2] / four
+            s[10]  = pi_invFour2
+            s[20] = pi_invFour2
+            s[19] = -pi_invFour2
+            s[11] = -pi_invFour2
 
             # For c = (0, j, k)
-            s[8] = pi[4] / four
-            s[4] = pi[4] / four
-            s[7] = -pi[4] / four
-            s[5] = -pi[4] / four
+            s[8]  = pi_invFour4
+            s[4]  = pi_invFour4
+            s[7]  = -pi_invFour4
+            s[5]  = -pi_invFour4
 
             return s
 
@@ -257,11 +263,31 @@ class KBC(Collision):
             feq: Any,
         ):
             temp = wp.cw_div(delta_h, feq)
-            sp1 = self.compute_dtype(0.0)
-            sp2 = self.compute_dtype(0.0)
+            sum_val1 = self.compute_dtype(0.0)
+            c1 = self.compute_dtype(0.0)
             for i in range(self.velocity_set.q):
-                sp1 += temp[i] * delta_s[i]
-                sp2 += temp[i] * delta_h[i]
+                x1 = temp[i] * delta_s[i]
+                t1 = sum_val1 + x1
+                if wp.abs(sum_val1) >= wp.abs(x1):
+                    c1 += (sum_val1 - t1) + x1
+                else:
+                    c1 += (x1 - t1) + sum_val1
+                sum_val1 = t1
+            sp1 = sum_val1 + c1
+
+            # Neumaier summation for sp2
+            sum_val2 = self.compute_dtype(0.0)
+            c2 = self.compute_dtype(0.0)
+            for i in range(self.velocity_set.q):
+                x2 = temp[i] * delta_h[i]
+                t2 = sum_val2 + x2
+                if wp.abs(sum_val2) >= wp.abs(x2):
+                    c2 += (sum_val2 - t2) + x2
+                else:
+                    c2 += (x2 - t2) + sum_val2
+                sum_val2 = t2
+            sp2 = sum_val2 + c2
+
             return sp1, sp2
 
         # Construct the functional

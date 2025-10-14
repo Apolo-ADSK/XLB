@@ -213,7 +213,8 @@ class MomentumTransfer(Operator):
 
     def _construct_warp(self):
         # Set local constants
-        _c = self.velocity_set.c
+        _c = self.velocity_set.c        
+        _c_float = self.velocity_set.c_float
         _opp_indices = self.velocity_set.opp_indices
         _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
         _missing_mask_vec = wp.vec(self.velocity_set.q, dtype=wp.uint8)
@@ -255,10 +256,8 @@ class MomentumTransfer(Operator):
                     for l in range(self.velocity_set.q):
                         if _missing_mask[l] == wp.uint8(1):
                             phi = f_post_collision[_opp_indices[l]] + f_post_stream[l]
-                            if _c[d, _opp_indices[l]] == 1:
-                                m[d] += phi
-                            elif _c[d, _opp_indices[l]] == -1:
-                                m[d] -= phi
+                            m[d] += phi *_c_float[d, _opp_indices[l]]
+                            
             # Atomic sum to get the total force vector
             wp.atomic_add(force, 0, m)
 
