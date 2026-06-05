@@ -1392,7 +1392,7 @@ class MultiresIO(object):
                 )
                 p_static = cs2 * (rho - rho_ref)
                 p_total = p_static + 0.5 * rho * u_sq
-                fields_data["CpTotalLoss_0"] = (p_total / q_dyn - 1.0).astype(rho.dtype, copy=False)
+                fields_data["CpTotalLoss_0"] = (1.0 - (p_total / q_dyn)).astype(rho.dtype, copy=False)
 
             elif name == "qdyn":
                 # Dynamic pressure 0.5*rho*|u|^2 in Pa (no atmospheric offset, so it
@@ -1565,7 +1565,7 @@ class MultiresIO(object):
         component=None,
         show_axes=False,
         show_colorbar=False,
-        normalize=1.0,
+        normalize=None,
         output=None,
         width=None,
         height=None,
@@ -1597,8 +1597,9 @@ class MultiresIO(object):
             Physical size of slice grid (width, height).
         cmap : str
             Matplotlib colormap.
-        normalize : float
-            Factor to scale and normalize data to ensure consistent images
+        normalize : float or tuple
+            Factor to scale  and normalize data to ensure consistent images
+            (min, max) tuple to scale  and normalize data to ensure consistent images (value - min) / (max- min)
         derived : list[str], optional
             Derived fields to synthesize from the base NEON fields you pass
             (e.g. ["pressure"]). Pass the base fields the derived quantity needs
@@ -1657,10 +1658,18 @@ class MultiresIO(object):
             field_name = list(fields_data.keys())[component]
             cell_data = fields_data[field_name]
 
-        if normalize != 1.0:  
+        if normalize is None:
+            pass
+        elif isinstance(normalize, tuple):
+            vmin, vmax = normalize
+            cell_data = np.clip((cell_data - vmin) / (vmax - vmin), 0, 1)
+        else:
             cell_data = np.clip((cell_data / normalize),0,1)
-        else:   
-            cell_data = cell_data      
+
+        # if normalize != 1.0:  
+        #     cell_data = np.clip((cell_data / normalize),0,1)
+        # else:   
+        #     cell_data = cell_data      
 
         # Plot each field in the dictionary
         self._to_slice_image_single_field(
@@ -1700,6 +1709,7 @@ class MultiresIO(object):
         height,
         width_vec,
         height_vec,
+        workers=-1,
         **kwargs,
     ):
         """
@@ -1814,7 +1824,7 @@ class MultiresIO(object):
 
         # Find k nearest neighbors for smoother interpolation
         k = min(4, len(points))
-        distances, indices = tree.query(query_points, k=k, workers=-1)
+        distances, indices = tree.query(query_points, k=k, workers=workers)
 
         if k == 1:
             distances = distances[:, None]
