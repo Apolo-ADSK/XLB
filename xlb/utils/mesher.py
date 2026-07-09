@@ -2382,12 +2382,23 @@ class MultiresIO(object):
         max_distance=None,
         half_space_tolerance=0.25,
         aggregate="median",
+        tree=None,
+        centroids=None,
     ):
-        
+
         sample_dx = float(sample_dx)
         surface_points = np.asarray(surface_points, dtype=np.float32)
         surface_normals = np.asarray(surface_normals, dtype=np.float32)
         cell_values = np.asarray(cell_values, dtype=np.float32)
+
+        # Sampling source: an explicit (tree, centroids, cell_values) triple lets
+        # callers restrict sampling to fluid cells only, so the invalid data held
+        # in the solid shell voxels intersecting the body never contributes.
+        # Default to the all-cells tree/centroids for backward compatibility.
+        if tree is None:
+            tree = self.kd_tree
+        if centroids is None:
+            centroids = self.centroids
 
         surface_normals /= np.maximum(np.linalg.norm(surface_normals, axis=1, keepdims=True), 1e-20)
 
@@ -2402,15 +2413,14 @@ class MultiresIO(object):
         base_points_flat = np.repeat(surface_points, n_shells, axis=0)
         normals_flat = np.repeat(surface_normals, n_shells, axis=0)
 
-        tree = self.kd_tree 
-        kk = min(int(k), len(self.centroids))
+        kk = min(int(k), len(centroids))
         distances, indices = tree.query(queries_flat, k=kk)
 
         if kk == 1:
             distances = distances[:, None]
             indices = indices[:, None]
 
-        neighbor_points = self.centroids[indices]
+        neighbor_points = centroids[indices]
         neighbor_values = cell_values[indices]
 
         signed = np.einsum("qki,qi->qk", neighbor_points - base_points_flat[:, None, :], normals_flat)
@@ -2458,11 +2468,37 @@ class MultiresIO(object):
         max_distance=None,
         half_space_tolerance=0.25,
         aggregate="median",
+        selector_values=None,
+        solid_mask=None,
     ):
+        tree = None
+        centroids = None
+
+        sample_values = np.asarray(cell_values, dtype=np.float32)
+        selector_sample = None if selector_values is None else np.asarray(selector_values, dtype=np.float32)
+
+        if solid_mask is not None:
+            solid_mask = np.asarray(solid_mask, dtype=bool)
+            assert solid_mask.shape[0] == self.centroids.shape[0], (
+                "solid_mask must align with centroids."
+            )
+
+            fluid = ~solid_mask
+            if not fluid.any():
+                raise ValueError("solid_mask excludes all cells; no fluid data to sample.")
+
+            centroids = np.ascontiguousarray(self.centroids[fluid])
+            sample_values = np.ascontiguousarray(sample_values[fluid])
+            tree = cKDTree(centroids)
+
+            if selector_sample is not None:
+                selector_sample = np.ascontiguousarray(selector_sample[fluid])
+
+        # Always sample the requested field here.
         plus_vals, plus_score = self._sample_surface_scalar_one_side(
             surface_points=surface_points,
             surface_normals=surface_normals,
-            cell_values=cell_values,
+            cell_values=sample_values,
             sample_dx=sample_dx,
             shell_factors=shell_factors,
             k=k,
@@ -2470,12 +2506,14 @@ class MultiresIO(object):
             max_distance=max_distance,
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
+            tree=tree,
+            centroids=centroids,
         )
 
         minus_vals, minus_score = self._sample_surface_scalar_one_side(
             surface_points=surface_points,
             surface_normals=-surface_normals,
-            cell_values=cell_values,
+            cell_values=sample_values,
             sample_dx=sample_dx,
             shell_factors=shell_factors,
             k=k,
@@ -2483,15 +2521,69 @@ class MultiresIO(object):
             max_distance=max_distance,
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
+            tree=tree,
+            centroids=centroids,
         )
 
-        use_minus = ~(minus_score > plus_score)
+        # Use velocity only to choose the side, not as the exported value.
+        if selector_sample is not None:
+            sel_plus, _ = self._sample_surface_scalar_one_side(
+                surface_points=surface_points,
+                surface_normals=surface_normals,
+                cell_values=selector_sample,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                tree=tree,
+                centroids=centroids,
+            )
+
+            sel_minus, _ = self._sample_surface_scalar_one_side(
+                surface_points=surface_points,
+                surface_normals=-surface_normals,
+                cell_values=selector_sample,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                tree=tree,
+                centroids=centroids,
+            )
+
+            side_pref = (sel_plus - sel_minus).astype(np.float32)
+          
+            use_minus = side_pref < 0.0
+        else:
+            use_minus = ~(minus_score > plus_score)
 
         mapped = plus_vals.copy()
         mapped[use_minus] = minus_vals[use_minus]
 
         chosen_normals = surface_normals.copy()
         chosen_normals[use_minus] *= -1.0
+
+        print(
+            "\tBIDIR PATCH ACTIVE: "
+            f"cell_values range=[{np.nanmin(cell_values):.6g}, {np.nanmax(cell_values):.6g}], "
+            f"sample_values range=[{np.nanmin(sample_values):.6g}, {np.nanmax(sample_values):.6g}], "
+            f"plus_vals range=[{np.nanmin(plus_vals):.6g}, {np.nanmax(plus_vals):.6g}], "
+            f"minus_vals range=[{np.nanmin(minus_vals):.6g}, {np.nanmax(minus_vals):.6g}], "
+            f"mapped range=[{np.nanmin(mapped):.6g}, {np.nanmax(mapped):.6g}]"
+        )
+        if selector_sample is not None:
+            print(
+                "\tBIDIR SELECTOR ONLY: "
+                f"selector_sample range=[{np.nanmin(selector_sample):.6g}, {np.nanmax(selector_sample):.6g}], "
+                f"sel_plus range=[{np.nanmin(sel_plus):.6g}, {np.nanmax(sel_plus):.6g}], "
+                f"sel_minus range=[{np.nanmin(sel_minus):.6g}, {np.nanmax(sel_minus):.6g}]"
+            )
 
         return mapped.astype(np.float32), chosen_normals.astype(np.float32), use_minus
 
@@ -2587,7 +2679,392 @@ class MultiresIO(object):
         # Single disk write
         with open(vtk_filename, "w") as f:
             f.write(buf.getvalue())
-            
+
+    @staticmethod
+    def _get_cmap0(cmap):
+        """Fetch a matplotlib colormap across matplotlib versions."""
+        import matplotlib
+
+        try:
+            return matplotlib.colormaps[cmap]  # matplotlib >= 3.5
+        except (AttributeError, KeyError):
+            import matplotlib.cm as cm
+
+            return cm.get_cmap(cmap)
+
+    @staticmethod
+    def _scalar_to_rgb0(values, cmap="turbo", clim=None):
+        """Map a 1-D scalar array to an (N, 3) float32 RGB array in [0, 1].
+
+        Uses matplotlib's colormaps when available (the main solver already
+        depends on matplotlib); falls back to a simple blue-white-red ramp so
+        the USD export never hard-fails on a missing colormap backend. Returns
+        ``(rgb, (vmin, vmax))`` so callers can report the range that was baked in.
+        """
+        values = np.asarray(values, dtype=np.float64).ravel()
+        finite = np.isfinite(values)
+
+        if clim is not None:
+            vmin, vmax = float(clim[0]), float(clim[1])
+        elif finite.any():
+            vmin = float(np.min(values[finite]))
+            vmax = float(np.max(values[finite]))
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin + 1.0
+
+        t = np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
+        t[~finite] = 0.0
+
+        try:
+            rgb = np.asarray(MultiresIO._get_cmap(cmap)(t)[:, :3], dtype=np.float32)
+        except Exception:
+            # Blue (low) -> white (mid) -> red (high) fallback.
+            r = np.clip(2.0 * t, 0.0, 1.0)
+            b = np.clip(2.0 * (1.0 - t), 0.0, 1.0)
+            g = 1.0 - np.abs(2.0 * t - 1.0)
+            rgb = np.stack([r, g, b], axis=1).astype(np.float32)
+
+        return rgb, (vmin, vmax)
+
+    @staticmethod
+    def _write_colormap_texture0(png_path, cmap="turbo", width=256, height=8):
+        """Write a horizontal colormap ramp PNG used as the surface-field texture.
+
+        Column ``i`` holds ``cmap(i / (width - 1))`` so that a UV coordinate of
+        ``u = (value - vmin) / (vmax - vmin)`` samples the matching colour. The
+        ramp is constant vertically (``v`` is ignored), so a few rows are enough.
+        Falls back to a blue-white-red ramp if matplotlib is unavailable.
+        """
+        t = np.linspace(0.0, 1.0, int(width))
+        try:
+            row = np.asarray(MultiresIO._get_cmap(cmap)(t)[:, :3], dtype=np.float32)
+        except Exception:
+            r = np.clip(2.0 * t, 0.0, 1.0)
+            b = np.clip(2.0 * (1.0 - t), 0.0, 1.0)
+            g = 1.0 - np.abs(2.0 * t - 1.0)
+            row = np.stack([r, g, b], axis=1).astype(np.float32)
+
+        img = np.repeat(row[None, :, :], int(height), axis=0)
+
+        try:
+            import matplotlib.image as mpimg
+
+            mpimg.imsave(png_path, img)
+        except Exception:
+            # Minimal PNG writer fallback via PIL if matplotlib's saver is absent.
+            from PIL import Image
+
+            Image.fromarray((img * 255.0 + 0.5).astype(np.uint8)).save(png_path)
+        return png_path
+
+    @staticmethod
+    def _get_cmap(cmap):
+        """
+        Return a matplotlib colormap. During development, fail loudly if the name
+        is invalid instead of silently falling back to blue-white-red.
+        """
+        if cmap is None:
+            cmap = "turbo"
+
+        # Already a colormap object.
+        if callable(cmap) and hasattr(cmap, "name"):
+            return cmap
+
+        cmap = str(cmap)
+
+        try:
+            import matplotlib
+            if hasattr(matplotlib, "colormaps"):
+                return matplotlib.colormaps.get_cmap(cmap)
+        except Exception as exc:
+            print(f"\tmatplotlib.colormaps lookup failed for {cmap!r}: {exc}")
+
+        try:
+            import matplotlib.cm as cm
+            return cm.get_cmap(cmap)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not load matplotlib colormap {cmap!r}. "
+                "Do not fall back silently; check spelling/version."
+            ) from exc
+
+    @staticmethod
+    def _write_colormap_texture(png_path, cmap="turbo", width=256, height=8):
+        import numpy as np
+
+        t = np.linspace(0.0, 1.0, int(width))
+
+        # Fail loudly here while debugging.
+        cm_obj = MultiresIO._get_cmap(cmap)
+        row = np.asarray(cm_obj(t)[:, :3], dtype=np.float32)
+
+        print(
+            f"\tWriting cmap texture {png_path} using requested cmap={cmap!r}, "
+            f"resolved cmap={getattr(cm_obj, 'name', '<unnamed>')!r}, "
+            f"left_rgb={row[0]}, mid_rgb={row[len(row)//2]}, right_rgb={row[-1]}"
+        )
+
+        img = np.repeat(row[None, :, :], int(height), axis=0)
+
+        try:
+            import matplotlib.image as mpimg
+            mpimg.imsave(png_path, img)
+        except Exception:
+            from PIL import Image
+            Image.fromarray((img * 255.0 + 0.5).astype(np.uint8)).save(png_path)
+
+        return png_path
+
+    @staticmethod
+    def _scalar_to_rgb(values, cmap="turbo", clim=None):
+        import numpy as np
+
+        values = np.asarray(values, dtype=np.float64).ravel()
+        finite = np.isfinite(values)
+
+        if clim is not None:
+            vmin, vmax = float(clim[0]), float(clim[1])
+        elif finite.any():
+            vmin = float(np.min(values[finite]))
+            vmax = float(np.max(values[finite]))
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmax = vmin + 1.0
+
+        t = np.clip((values - vmin) / (vmax - vmin), 0.0, 1.0)
+        t[~finite] = 0.0
+
+        cm_obj = MultiresIO._get_cmap(cmap)
+        rgb = np.asarray(cm_obj(t)[:, :3], dtype=np.float32)
+
+        return rgb, (vmin, vmax)
+
+    @staticmethod
+    def _usd_vec_array(arr, ncomp):
+        """Format an (N, ncomp) float array as a USD tuple array body: '(a, b, c), ...'."""
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1, ncomp)
+        cols = [np.char.mod("%.6g", arr[:, i]) for i in range(ncomp)]
+        joined = cols[0]
+        for c in cols[1:]:
+            joined = np.char.add(np.char.add(joined, ", "), c)
+        rows = np.char.add(np.char.add("(", joined), ")")
+        return ", ".join(rows.tolist())
+    
+    def _infer_surface_field_clim(self, field_base_name, component=None):
+            """Default colour range (vmin, vmax) for a surface field's USD export.
+
+            Mirrors the fixed ranges used for the slice images so the baked surface
+            colours are directly comparable:
+            - velocity (magnitude): 0 .. 1.5 * free-stream speed (the slice
+                ``velocityFactor`` default), via the UnitConvertor.
+            - Cp: -1 .. 1, CpTotal: 0.4 .. 1, CpTotalLoss: 0 .. 0.8 (dimensionless).
+            - pressure: 101300 .. 101800 Pa.
+            Returns None (auto-range from the data) when no convention applies, e.g.
+            a single signed velocity component whose sign is flow-orientation dependent.
+            """
+            name = str(field_base_name).lower()
+
+            if name == "cp":
+                return (-1.0, 1.0)
+            if name == "cptotal":
+                return (0.4, 1.0)
+            if name == "cptotalloss":
+                return (0.0, 0.8)
+            if name == "pressure":
+                return (101300.0, 101800.0)
+
+            if name == "velocity":
+                # Magnitude scales with the free-stream speed; a single signed
+                # component is direction-dependent, so leave it auto-ranged.
+                if component is not None:
+                    return None
+                uc = self.unit_convertor
+                u_inf = getattr(uc, "velocity_phys_unit", None) if uc is not None else None
+                if u_inf:
+                    return (0.0, 1.5 * abs(float(u_inf)))
+                return None
+
+            return None
+
+    @staticmethod
+    def _usd_scalar_array(arr, fmt="%.6g"):
+        """Format a 1-D array as a USD scalar array body: 'a, b, c'."""
+        arr = np.asarray(arr).ravel()
+        return ", ".join(np.char.mod(fmt, arr).tolist())
+    
+    def _write_polydata_usd(
+        self,
+        usd_filename,
+        vertices,
+        faces,
+        point_data=None,
+        cell_data=None,
+        color_field=None,
+        cmap="turbo",
+        clim=None,
+        uniform_color=None,
+        up_axis="Z",
+        meters_per_unit=1.0,
+        prim_name="surface",
+    ):
+        """Write a triangle mesh + scalar fields to an OpenUSD ASCII (.usda) file.
+
+        Mirrors :meth:`_write_polydata_vtk` but emits USD that Autodesk VRED (and
+        other USD-aware tools) imports natively. Every entry in ``point_data`` /
+        ``cell_data`` is written as a primvar (``vertex`` / ``uniform``
+        interpolation respectively). ``color_field`` names a 1-D scalar in
+        ``point_data`` that is additionally baked into a per-vertex
+        ``primvars:displayColor`` via ``cmap`` so the result renders in colour
+        immediately without a shader network. For Autodesk VRED, which ignores
+        ``displayColor`` vertex primvars on import, the field is also baked into a
+        colormap texture sampled through a ``UsdPreviewSurface`` material via
+        per-vertex UV (``st``) coordinates.
+        """
+        import io
+        import os
+        import re
+
+        vertices = np.asarray(vertices, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+        point_data = point_data or {}
+        cell_data = cell_data or {}
+
+        n_verts = len(vertices)
+        n_faces = len(faces)
+
+        usd_filename = usd_filename if usd_filename.endswith((".usda", ".usd")) else usd_filename + ".usda"
+
+        def sanitize(name):
+            s = re.sub(r"[^0-9a-zA-Z_]", "_", str(name))
+            return ("_" + s) if (not s or s[0].isdigit()) else s
+
+        buf = io.StringIO()
+        buf.write("#usda 1.0\n")
+        buf.write("(\n")
+        buf.write(f'    defaultPrim = "{prim_name}"\n')
+        buf.write(f"    metersPerUnit = {float(meters_per_unit)}\n")
+        buf.write(f'    upAxis = "{up_axis}"\n')
+        buf.write(")\n\n")
+
+        buf.write(f'def Mesh "{prim_name}"\n')
+        buf.write("{\n")
+
+        # Topology
+        buf.write(f"    int[] faceVertexCounts = [{self._usd_scalar_array(np.full(n_faces, 3, dtype=np.int32), fmt='%d')}]\n")
+        buf.write(f"    int[] faceVertexIndices = [{self._usd_scalar_array(faces.ravel(), fmt='%d')}]\n")
+        buf.write(f"    point3f[] points = [{self._usd_vec_array(vertices, 3)}]\n")
+        buf.write('    uniform token subdivisionScheme = "none"\n')
+
+        # Colour from the chosen scalar field, baked as a colormap texture +
+        # per-vertex UVs + a UsdPreviewSurface material (what VRED renders), plus
+        # displayColor as a fallback for viewers that honour vertex colours.
+        texture_field = color_field is not None and color_field in point_data
+        if texture_field:
+            field = np.asarray(point_data[color_field], dtype=np.float32)
+            if field.ndim == 2 and field.shape[1] == 3:
+                # Vector field -> colour by magnitude.
+                field = np.linalg.norm(field, axis=1)
+            field = field.ravel()
+
+            finite = np.isfinite(field)
+            if clim is not None:
+                vmin, vmax = float(clim[0]), float(clim[1])
+            elif finite.any():
+                vmin, vmax = float(np.min(field[finite])), float(np.max(field[finite]))
+            else:
+                vmin, vmax = 0.0, 1.0
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                vmax = vmin + 1.0
+
+            # UV: u = normalized value -> column in the ramp, v = mid-row.
+            u = np.clip((field - vmin) / (vmax - vmin), 0.005, 0.995)
+            u[~finite] = 0.0
+            st = np.column_stack([u, np.full_like(u, 0.5)])
+
+            # Write the colormap ramp PNG next to the USD file.
+            tex_name = os.path.splitext(os.path.basename(usd_filename))[0] + "_cmap.png"
+            tex_path = os.path.join(os.path.dirname(usd_filename), tex_name)
+            self._write_colormap_texture(tex_path, cmap=cmap)
+
+            # displayColor fallback for displayColor-aware viewers.
+            rgb, _ = self._scalar_to_rgb(field, cmap=cmap, clim=(vmin, vmax))
+            buf.write(f"    color3f[] primvars:displayColor = [{self._usd_vec_array(rgb, 3)}] (\n")
+            buf.write('        interpolation = "vertex"\n')
+            buf.write("    )\n")
+
+            buf.write(f"    texCoord2f[] primvars:st = [{self._usd_vec_array(st, 2)}] (\n")
+            buf.write('        interpolation = "vertex"\n')
+            buf.write("    )\n")
+            buf.write(f"    rel material:binding = </{prim_name}/Material>\n")
+
+            print(f"\tUSD field '{color_field}' textured via {tex_name} (cmap={cmap}, range=[{vmin:.4g}, {vmax:.4g}])")
+        elif uniform_color is not None:
+            r, g, b = (float(c) for c in uniform_color)
+            buf.write(f"    color3f[] primvars:displayColor = [({r:.6g}, {g:.6g}, {b:.6g})] (\n")
+            buf.write('        interpolation = "constant"\n')
+            buf.write("    )\n")
+
+        # Raw scalar/vector primvars (point data -> vertex, cell data -> uniform).
+        for interp, data, expected in (("vertex", point_data, n_verts), ("uniform", cell_data, n_faces)):
+            for name, arr in data.items():
+                arr = np.asarray(arr, dtype=np.float32)
+                pv = sanitize(name)
+                if arr.ndim == 1:
+                    buf.write(f"    float[] primvars:{pv} = [{self._usd_scalar_array(arr)}] (\n")
+                elif arr.ndim == 2 and arr.shape[1] == 3:
+                    buf.write(f"    float3[] primvars:{pv} = [{self._usd_vec_array(arr, 3)}] (\n")
+                else:
+                    raise ValueError(f"Unsupported primvar shape for '{name}': {arr.shape}")
+                buf.write(f'        interpolation = "{interp}"\n')
+                buf.write("    )\n")
+
+        # UsdPreviewSurface material that samples the colormap texture using the
+        # 'st' primvar. This is the path VRED honours for baked field colours.
+        if texture_field:
+            buf.write(f'    def Material "Material"\n')
+            buf.write("    {\n")
+            buf.write("        token outputs:surface.connect = "
+                      f"</{prim_name}/Material/Shader.outputs:surface>\n")
+            buf.write('        def Shader "Shader"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdPreviewSurface"\n')
+            buf.write("            color3f inputs:diffuseColor.connect = "
+                      f"</{prim_name}/Material/Tex.outputs:rgb>\n")
+            buf.write("            float inputs:roughness = 1\n")
+            buf.write("            float inputs:metallic = 0\n")
+            buf.write("            token outputs:surface\n")
+            buf.write("        }\n")
+            buf.write('        def Shader "Tex"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdUVTexture"\n')
+            buf.write(f"            asset inputs:file = @./{tex_name}@\n")
+            buf.write("            float2 inputs:st.connect = "
+                      f"</{prim_name}/Material/Reader.outputs:result>\n")
+            buf.write('            token inputs:wrapS = "clamp"\n')
+            buf.write('            token inputs:wrapT = "clamp"\n')
+            buf.write("            float3 outputs:rgb\n")
+            buf.write("        }\n")
+            buf.write('        def Shader "Reader"\n')
+            buf.write("        {\n")
+            buf.write('            uniform token info:id = "UsdPrimvarReader_float2"\n')
+            buf.write('            token inputs:varname = "st"\n')
+            buf.write("            float2 outputs:result\n")
+            buf.write("        }\n")
+            buf.write("    }\n")
+
+        buf.write("}\n")
+
+        with open(usd_filename, "w") as f:
+            f.write(buf.getvalue())
+
+        print(f"\tUSD surface ({n_verts:,} verts, {n_faces:,} tris) written to {usd_filename}")
+        return usd_filename
+
     def _fields_data_to_surface_vtk(
         self,
         output_filename,
@@ -2604,10 +3081,32 @@ class MultiresIO(object):
         aggregate="median",
         smooth_iterations=2,
         smooth_relaxation=0.25,
+        export="usd",
+        usd_clim=None,
+        usd_cmap=None,
+        solid_mask=None,
+        side_selector=None,
         export_debug_arrays=True,
     ):
         tic_write = time.perf_counter()
         field_name, cell_values = self._select_surface_field(fields_data, field_base_name, component=component)
+        selector_values = None
+        if side_selector == "velocity":
+            vel_keys = sorted(
+                (kk for kk in fields_data if kk.startswith("velocity_")),
+                key=lambda kk: int(kk.rsplit("_", 1)[1]),
+            )
+            if vel_keys:
+                vmag_sq = None
+                for kk in vel_keys:
+                    comp = np.asarray(fields_data[kk], dtype=np.float64)
+                    vmag_sq = comp * comp if vmag_sq is None else vmag_sq + comp * comp
+                selector_values = np.sqrt(vmag_sq).astype(np.float32)
+            else:
+                print("\tside_selector='velocity' but no velocity field present; "
+                      "falling back to per-field score selection.")
+        elif side_selector not in ("velocity", "score"):
+            raise ValueError(f"Unknown side_selector '{side_selector}' (use 'velocity' or 'score').")
 
         mesh = surface_mesh_filename
         vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -2637,6 +3136,8 @@ class MultiresIO(object):
             max_distance=max_distance,
             half_space_tolerance=half_space_tolerance,
             aggregate=aggregate,
+            selector_values=selector_values,
+            solid_mask=solid_mask
         )
         toc_write = time.perf_counter()
         print(f"\tSurface field mapped in {toc_write - tic_write:0.1f} seconds")
@@ -2654,13 +3155,35 @@ class MultiresIO(object):
             point_data["chosen_normal"] = chosen_normals
             point_data["normal_flipped"] = flipped.astype(np.float32)
 
-        self._write_polydata_vtk(
-            vtk_filename,
-            vertices,
-            faces,
-            point_data=point_data,
-            cell_data=None,
-        )
+
+
+        if export == "vtk" or export=="both":
+            self._write_polydata_vtk(
+                vtk_filename,
+                vertices,
+                faces,
+                point_data=point_data,
+                cell_data=None,
+            )
+
+        if export == "usd" or export=="both":
+            if usd_clim is None:
+                usd_clim = self._infer_surface_field_clim(field_base_name, component=component)
+            if usd_cmap is None:
+                usd_cmap = "turbo"
+
+            usd_filename = output_filename if output_filename.endswith(".usda") else output_filename + ".usda"
+            self._write_polydata_usd(
+                usd_filename,
+                vertices,
+                faces,
+                point_data=point_data,
+                cell_data=None,
+                color_field=field_name,
+                cmap=usd_cmap,
+                clim=usd_clim,
+            )
+
         
         toc_write = time.perf_counter()
         print(f"\tSurface field written to {vtk_filename} in {toc_write - tic_write:0.1f} seconds")
@@ -2682,26 +3205,62 @@ class MultiresIO(object):
         aggregate="median",
         smooth_iterations=2,
         smooth_relaxation=0.2,
-        export_debug_arrays=True,
+        bc_mask=None,
+        export="usd",
+        usd_clim=None,
+        usd_cmap=None,
+        side_selector="velocity",
+        export_debug_arrays=False,
     ):
-        fields_data = self.get_fields_data(field_neon_dict)
-        return self._fields_data_to_surface_vtk(
-            output_filename=output_filename,
-            surface_mesh_filename=surface_mesh_filename,
-            fields_data=fields_data,
-            field_base_name=field_base_name,
-            component=component,
-            sample_dx=sample_dx,
-            shell_factors=shell_factors,
-            k=k,
-            power=power,
-            max_distance=max_distance,
-            half_space_tolerance=half_space_tolerance,
-            aggregate=aggregate,
-            smooth_iterations=smooth_iterations,
-            smooth_relaxation=smooth_relaxation,
-            export_debug_arrays=export_debug_arrays,
-        )
+        avg_fields = self.finalize_time_average(keep_state=keep_state)
+        if bc_mask is None:
+            return self._fields_data_to_surface_vtk(
+                output_filename=output_filename,
+                surface_mesh_filename=surface_mesh_filename,
+                fields_data=avg_fields,
+                field_base_name=field_base_name,
+                component=component,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                smooth_iterations=smooth_iterations,
+                smooth_relaxation=smooth_relaxation,
+                export=export,
+                usd_clim=usd_clim,
+                usd_cmap=usd_cmap,
+                solid_mask=None,
+                side_selector=side_selector,
+                export_debug_arrays=export_debug_arrays,
+            )
+        else:
+            bc_fields = self.get_fields_data({"bc_mask": bc_mask})
+            solid_mask = self._solid_mask_from_fields_data(bc_fields)
+            return self._fields_data_to_surface_vtk(
+                output_filename=output_filename,
+                surface_mesh_filename=surface_mesh_filename,
+                fields_data=avg_fields,
+                field_base_name=field_base_name,
+                component=component,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                smooth_iterations=smooth_iterations,
+                smooth_relaxation=smooth_relaxation,
+                export=export,
+                usd_clim=usd_clim,
+                usd_cmap=usd_cmap,
+                solid_mask=solid_mask,
+                side_selector=side_selector,
+                export_debug_arrays=export_debug_arrays,
+            )
 
     def to_surface_vtk_time_average(
         self,
@@ -2719,24 +3278,686 @@ class MultiresIO(object):
         aggregate="median",
         smooth_iterations=2,
         smooth_relaxation=0.2,
-        export_debug_arrays=True,
+        bc_mask=None,
+        export="usd",
+        usd_clim=None,
+        usd_cmap=None,
+        side_selector="velocity",
+        export_debug_arrays=False,
     ):
         avg_fields = self.finalize_time_average(keep_state=keep_state)
-        return self._fields_data_to_surface_vtk(
-            output_filename=output_filename,
-            surface_mesh_filename=surface_mesh_filename,
-            fields_data=avg_fields,
-            field_base_name=field_base_name,
-            component=component,
-            sample_dx=sample_dx,
-            shell_factors=shell_factors,
+        if bc_mask is None:
+            return self._fields_data_to_surface_vtk(
+                output_filename=output_filename,
+                surface_mesh_filename=surface_mesh_filename,
+                fields_data=avg_fields,
+                field_base_name=field_base_name,
+                component=component,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                smooth_iterations=smooth_iterations,
+                smooth_relaxation=smooth_relaxation,
+                export=export,
+                usd_clim=usd_clim,
+                usd_cmap=usd_cmap,
+                solid_mask=None,
+                side_selector=side_selector,
+                export_debug_arrays=export_debug_arrays,
+            )
+        else:
+            bc_fields = self.get_fields_data({"bc_mask": bc_mask})
+            solid_mask = self._solid_mask_from_fields_data(bc_fields)
+            return self._fields_data_to_surface_vtk(
+                output_filename=output_filename,
+                surface_mesh_filename=surface_mesh_filename,
+                fields_data=avg_fields,
+                field_base_name=field_base_name,
+                component=component,
+                sample_dx=sample_dx,
+                shell_factors=shell_factors,
+                k=k,
+                power=power,
+                max_distance=max_distance,
+                half_space_tolerance=half_space_tolerance,
+                aggregate=aggregate,
+                smooth_iterations=smooth_iterations,
+                smooth_relaxation=smooth_relaxation,
+                export=export,
+                usd_clim=usd_clim,
+                usd_cmap=usd_cmap,
+                solid_mask=solid_mask,
+                side_selector=side_selector,
+                export_debug_arrays=export_debug_arrays,
+            )
+   
+    def _solid_mask_from_fields_data(self, fields_data, bc_mask_key="bc_mask_0"):
+        """Per-cell bool mask (True == solid) from an extracted bc_mask field."""
+        from xlb.cell_type import BC_SOLID
+
+        if bc_mask_key not in fields_data:
+            raise KeyError(
+                f"'{bc_mask_key}' not found; include 'bc_mask' in the field dict "
+                "(or pass bc_mask_neon for the time-averaged variant) to exclude solids."
+            )
+        bc = np.asarray(fields_data[bc_mask_key])
+        return np.rint(bc).astype(np.int32) == int(BC_SOLID)
+
+    def _infer_ambient_fill(self, field_base_name, component=None):
+        """Free-stream/ambient value used to cap an iso-surface at the body.
+
+        Returned in the field's physical units (matching ``iso_value``): the
+        contoured scalar reaches the iso routine already converted (velocity in
+        m/s, density in kg/m^3, pressure in Pa; Cp/CpTotal/CpTotalLoss/qdyn left
+        as emitted). The value is the clean reference state, NOT read from solid
+        voxels. Returns None when it cannot be inferred reliably (the caller then
+        falls back to the open/masked-hole behaviour).
+        """
+        name = str(field_base_name).lower()
+
+        # Dimensionless pressure coefficients: reference state is exact and does
+        # not depend on the unit convertor.
+        if name == "cp":
+            return 0.0
+        if name == "cptotal":
+            return 1.0
+        if name == "cptotalloss":
+            return 0.0
+
+        uc = self.unit_convertor
+        if uc is None:
+            return None
+
+        if name == "velocity":
+            # Magnitude caps at the free-stream speed. A single signed component is
+            # direction-dependent (depends on flow orientation), so don't guess.
+            if component is None:
+                return float(uc.velocity_phys_unit)
+            return None
+        if name == "density":
+            return float(uc.reference_density)
+        if name == "pressure":
+            return float(uc.referece_pressure)  # attribute spelling per UnitConvertor
+        if name == "qdyn":
+            return 0.5 * float(uc.reference_density) * float(uc.velocity_phys_unit) ** 2
+
+        return None
+
+    @staticmethod
+    def _exterior_connected_fluid_mask(fluid_mask):
+        """Fluid grid points connected to the resample-grid boundary.
+
+        Takes the boolean fluid mask on the uniform iso grid (True where the
+        nearest cell is fluid) and floods inward from the six domain faces using
+        6-connectivity (face neighbours only). The result is True only for fluid
+        reachable from the exterior; fluid pockets sealed off by the body skin -
+        e.g. trapped cavities in a messy STL - come back False.
+
+        Those sealed pockets are what produce the spurious closed iso "balloons"
+        inside enclosed regions, so the caller treats them like the body interior
+        instead of contouring them. 6-connectivity is the conservative choice: a
+        single-voxel-thick body shell stays watertight against the flood (a
+        26-connected flood would leak through diagonal pinholes in the shell).
+        """
+        from scipy import ndimage
+
+        fluid_mask = np.asarray(fluid_mask, dtype=bool)
+        seed = np.zeros_like(fluid_mask)
+        # Seed every fluid grid point touching a face of the resample box.
+        seed[0, :, :] |= fluid_mask[0, :, :]
+        seed[-1, :, :] |= fluid_mask[-1, :, :]
+        seed[:, 0, :] |= fluid_mask[:, 0, :]
+        seed[:, -1, :] |= fluid_mask[:, -1, :]
+        seed[:, :, 0] |= fluid_mask[:, :, 0]
+        seed[:, :, -1] |= fluid_mask[:, :, -1]
+
+        structure = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
+        return ndimage.binary_propagation(seed, mask=fluid_mask, structure=structure)
+
+    def _remove_small_mesh_components(
+        self,
+        mesh,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
+    ):
+        """Remove tiny disconnected triangle islands from an extracted iso mesh.
+
+        Marching cubes can create small disconnected components when the sampled
+        scalar contains single-cell/voxel-scale noise. This keeps the main
+        connected components and drops islands whose face count or surface area is
+        tiny relative to the full iso-surface. If filtering would remove
+        everything, the largest component is kept as a safe fallback.
+        """
+        if mesh is None or len(mesh.faces) == 0:
+            return mesh
+
+        min_component_faces = int(min_component_faces or 0)
+        min_component_area_fraction = float(min_component_area_fraction or 0.0)
+
+        if not keep_largest_component and min_component_faces <= 0 and min_component_area_fraction <= 0.0:
+            return mesh
+
+        try:
+            components = mesh.split(only_watertight=False)
+        except Exception as exc:
+            print(f"\tConnected-component cleanup skipped: {exc}")
+            return mesh
+
+        if len(components) <= 1:
+            return mesh
+
+        components = list(components)
+        areas = np.asarray([float(getattr(c, "area", 0.0)) for c in components], dtype=np.float64)
+        faces = np.asarray([len(c.faces) for c in components], dtype=np.int64)
+
+        if keep_largest_component:
+            keep = np.zeros(len(components), dtype=bool)
+            keep[int(np.argmax(areas))] = True
+        else:
+            total_area = float(max(mesh.area, 1e-30))
+            min_area = min_component_area_fraction * total_area
+            keep = np.ones(len(components), dtype=bool)
+            if min_component_faces > 0:
+                keep &= faces >= min_component_faces
+            if min_component_area_fraction > 0.0:
+                keep &= areas >= min_area
+
+            if not np.any(keep):
+                keep[int(np.argmax(areas))] = True
+                print(
+                    "\tConnected-component cleanup would remove all components; "
+                    "kept the largest component instead."
+                )
+
+        n_removed = int(np.count_nonzero(~keep))
+        if n_removed == 0:
+            return mesh
+
+        kept_meshes = [components[i] for i in np.flatnonzero(keep)]
+        cleaned = trimesh.util.concatenate(kept_meshes)
+        try:
+            cleaned.remove_unreferenced_vertices()
+        except Exception:
+            pass
+
+        print(
+            f"\tConnected-component cleanup: removed {n_removed} small component(s); "
+            f"kept {len(kept_meshes)} component(s), {len(cleaned.faces):,}/{len(mesh.faces):,} tris"
+        )
+        return cleaned
+
+    def _scalar_to_isosurface_stl(
+        self,
+        output_filename,
+        cell_scalar,
+        iso_value,
+        solid_mask=None,
+        bounds=None,
+        pitch=None,
+        grid_resolution=512,
+        interpolation="idw",
+        k=8,
+        power=2.0,
+        smooth_iterations=10,
+        smooth_taubin_lambda=0.6,
+        smooth_taubin_nu=0.55,
+        step_size=1,
+        body_handling="cap",
+        fill_value=None,
+        remove_trapped_fluid=True,
+        lengthScale=1000.0,
+        remove_small_components=True,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
+    ):
+        """Resample a per-cell scalar onto a uniform grid and write an iso-surface STL.
+
+        The merged multi-resolution mesh is unstructured, so the scalar is
+        resampled (via the cell-centroid KDTree) onto an axis-aligned uniform
+        grid, then marching cubes extracts the iso-surface.
+
+        For a smooth, ParaView-like surface the default resampling is
+        inverse-distance weighting over the ``k`` nearest fluid cells (a
+        continuous field), and the extracted mesh is Taubin-smoothed. Nearest-
+        neighbour resampling (``interpolation="nearest"``) is faster but blocky.
+
+        Solid handling (when ``solid_mask`` is given):
+        - Solid (bc_mask==255) cells are ALWAYS excluded from the interpolation
+          source, so their invalid data never contributes to the contoured field.
+          The solid cells are used only to detect which grid points sit inside the
+          body (nearest-cell-is-solid); they contribute no data either way.
+        - ``body_handling`` controls what happens at those interior points:
+            * "cap" (default): stamp the ambient/free-stream ``fill_value`` into
+              the body interior so the surface caps cleanly at the body skin,
+              giving a closed, watertight-ish STL. ``fill_value`` must be a clean
+              constant on the OUTSIDE side of ``iso_value`` (e.g. CpTotal=1,
+              velocity=U_inf); it is NOT read from the solid voxels. If
+              ``fill_value`` is None here, capping cannot be done safely and the
+              routine falls back to "open" with a warning.
+            * "open": mask the interior out of marching cubes, leaving the surface
+              OPEN (a hole) where it meets the body.
+          Note: only the shell voxels intersecting the body mesh are solid; any
+          fluid in the interior is still contoured.
+        - ``remove_trapped_fluid`` (default True): flood-fill the fluid mask from
+          the domain boundary and treat fluid NOT connected to the exterior the
+          same as the body interior (capped under "cap", masked out under
+          "open"). This removes the spurious closed iso "balloons" that otherwise
+          form inside sealed cavities of messy STLs. Resolution-limited: a leak
+          narrower than ``pitch`` reads as sealed, so the dropped-point count is
+          logged. Requires a ``solid_mask``; a no-op when none is given.
+
+        ``lengthScale`` multiplies only the final STL vertices. For example,
+        ``lengthScale=1000`` exports a mesh whose coordinates are 1000x larger
+        (1 m becomes 1000 mm) without translating the origin or changing the
+        solver/model data.
+
+        ``remove_small_components`` removes tiny disconnected triangle islands
+        after marching cubes. This is useful for CpTotalLoss iso-surfaces where
+        voxel-scale noise can create small speckle components away from the main
+        structure.
+
+        Returns the trimesh.Trimesh, or None if the iso-value is outside the
+        sampled range (no surface).
+        """
+        try:
+            from skimage import measure
+        except ImportError as e:
+            raise ImportError(
+                "Iso-surface export requires scikit-image. Install it with "
+                "`pip install scikit-image`."
+            ) from e
+
+        tic = time.perf_counter()
+
+        lengthScale = float(lengthScale)
+        if not np.isfinite(lengthScale) or lengthScale <= 0.0:
+            raise ValueError(f"lengthScale must be a positive finite value, got {lengthScale!r}")
+
+        cell_scalar = np.asarray(cell_scalar, dtype=np.float32)
+        centroids = self.centroids
+        assert cell_scalar.shape[0] == centroids.shape[0], (
+            "cell_scalar length must match number of cells (centroids)."
+        )
+        if solid_mask is not None:
+            solid_mask = np.asarray(solid_mask, dtype=bool)
+            assert solid_mask.shape[0] == centroids.shape[0], "solid_mask must align with centroids."
+
+        if bounds is None:
+            gmin = self.coordinates.min(axis=0).astype(np.float64)
+            gmax = self.coordinates.max(axis=0).astype(np.float64)
+        else:
+            gmin = np.asarray(bounds[0], dtype=np.float64)
+            gmax = np.asarray(bounds[1], dtype=np.float64)
+        span = gmax - gmin
+        if np.any(span <= 0):
+            raise ValueError(f"Invalid iso-surface bounds: min={gmin}, max={gmax}")
+
+        if pitch is None:
+            pitch = float(span.max()) / float(max(1, int(grid_resolution)))
+        pitch = float(pitch)
+
+        dims = np.floor(span / pitch).astype(int) + 1
+        dims = np.maximum(dims, 2)
+        nx, ny, nz = (int(d) for d in dims)
+        total = nx * ny * nz
+        print(
+            f"\tIso-surface resample grid {nx}x{ny}x{nz} = {total:,} points "
+            f"(pitch={pitch:.6g}, ~{total * 4 / 1e6:.0f} MB)"
+        )
+
+        xs = gmin[0] + np.arange(nx) * pitch
+        ys = gmin[1] + np.arange(ny) * pitch
+        zs = gmin[2] + np.arange(nz) * pitch
+
+        # Interpolation source = fluid cells only, so solid (bc_mask==255) data
+        # (invalid) never contributes. A separate all-cells nearest lookup flags
+        # grid points sitting inside a solid voxel, which are masked out of
+        # marching cubes (open hole at the body).
+        has_solid = solid_mask is not None and bool(solid_mask.any())
+        if has_solid:
+            fluid = ~solid_mask
+            fluid_scalar = cell_scalar[fluid]
+            fluid_tree = cKDTree(centroids[fluid])
+            solid_tree = self.kd_tree  # all cells, for inside-body detection
+        else:
+            fluid_scalar = cell_scalar
+            fluid_tree = self.kd_tree
+            solid_tree = None
+
+        use_idw = str(interpolation).lower() == "idw" and fluid_scalar.shape[0] > 1
+        kk = max(1, min(int(k), fluid_scalar.shape[0])) if use_idw else 1
+
+        # Sample plane-by-plane along x to keep transient memory low.
+        vol = np.empty((nx, ny, nz), dtype=np.float32)
+        compute_mask = np.ones((nx, ny, nz), dtype=bool) if solid_tree is not None else None
+        Y, Z = np.meshgrid(ys, zs, indexing="ij")
+        Yf = Y.ravel()
+        Zf = Z.ravel()
+        plane_pts = np.empty((Yf.size, 3), dtype=np.float64)
+        plane_pts[:, 1] = Yf
+        plane_pts[:, 2] = Zf
+        for ix in range(nx):
+            plane_pts[:, 0] = xs[ix]
+            if use_idw:
+                dist, idx = fluid_tree.query(plane_pts, k=kk, workers=-1)
+                if kk == 1:
+                    dist = dist[:, None]
+                    idx = idx[:, None]
+                w = 1.0 / np.maximum(dist, 1e-12) ** float(power)
+                v = np.sum(w * fluid_scalar[idx], axis=1) / np.sum(w, axis=1)
+            else:
+                _, idx1 = fluid_tree.query(plane_pts, k=1, workers=-1)
+                v = fluid_scalar[idx1]
+            vol[ix] = v.reshape(ny, nz).astype(np.float32)
+            if solid_tree is not None:
+                _, idx_all = solid_tree.query(plane_pts, k=1, workers=-1)
+                # mask OUT (False) grid points whose nearest cell is solid
+                compute_mask[ix] = (~solid_mask[idx_all]).reshape(ny, nz)
+
+        np.nan_to_num(vol, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Resolve body handling. ``compute_mask`` is True for fluid grid points and
+        # False for points whose nearest cell is solid (inside the body).
+        mode = str(body_handling).lower()
+        if mode not in ("cap", "open"):
+            raise ValueError(f"body_handling must be 'cap' or 'open', got {body_handling!r}")
+
+        if compute_mask is not None and mode == "cap" and fill_value is None:
+            print(
+                "\tBody handling 'cap' requested but no fill_value could be resolved "
+                "(ambient value unknown for this quantity); falling back to 'open' "
+                "(masked hole at the body)."
+            )
+            mode = "open"
+
+        # Flood-fill: drop fluid grid points sealed off from the exterior flow so
+        # trapped cavities are treated like the body interior, not contoured into
+        # closed iso "balloons". ``keep_mask`` is the exterior-connected fluid;
+        # ``~keep_mask`` is body interior + trapped fluid.
+        keep_mask = compute_mask
+        if compute_mask is not None and remove_trapped_fluid:
+            exterior = self._exterior_connected_fluid_mask(compute_mask)
+            n_fluid = int(compute_mask.sum())
+            n_trapped = int(np.count_nonzero(compute_mask & ~exterior))
+            if not exterior.any() and n_fluid:
+                # Nothing reached the box faces (e.g. bounds cropped inside the
+                # body) - removing everything would be wrong, so skip.
+                print(
+                    "\tFlood-fill: no fluid reached the domain boundary; "
+                    "trapped-fluid removal skipped (check iso bounds)."
+                )
+            else:
+                keep_mask = exterior
+                pct = 100.0 * n_trapped / max(1, n_fluid)
+                print(
+                    f"\tFlood-fill: dropped {n_trapped:,} trapped-fluid grid points "
+                    f"({pct:.2f}% of fluid) not connected to the domain boundary"
+                )
+
+        if compute_mask is not None and mode == "cap":
+            # Stamp the ambient/free-stream constant into the body interior (and
+            # trapped fluid) so the surface caps cleanly at the skin and sealed
+            # pockets vanish. The fill is a clean constant, NOT read from solid
+            # voxels; it now legitimately participates in the field.
+            fv = np.float32(fill_value)
+            vol[~keep_mask] = fv
+            mc_mask = None
+            sample = vol
+            print(f"\tBody handling: cap (fill_value={float(fill_value):.6g})")
+        elif compute_mask is not None and mode == "open":
+            # Mask the body interior (and trapped fluid) out of marching cubes ->
+            # open surface (hole).
+            mc_mask = keep_mask
+            sample = vol[keep_mask]
+            print("\tBody handling: open (masked hole at the body)")
+        else:
+            # No solids present (nothing to cap or open).
+            mc_mask = None
+            sample = vol
+
+        vmin = float(sample.min())
+        vmax = float(sample.max())
+        if not (vmin < float(iso_value) < vmax):
+            print(
+                f"\tIso-value {iso_value} is outside the sampled range "
+                f"[{vmin:.4g}, {vmax:.4g}] - no surface extracted."
+            )
+            return None
+
+        mc_kwargs = dict(
+            level=float(iso_value),
+            spacing=(pitch, pitch, pitch),
+            step_size=int(step_size),
+            allow_degenerate=False,
+        )
+        if mc_mask is not None:
+            try:
+                verts, faces, normals, _ = measure.marching_cubes(vol, mask=mc_mask, **mc_kwargs)
+            except TypeError:
+                print("\tThis scikit-image lacks marching_cubes(mask=...); body will not be opened.")
+                verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
+        else:
+            verts, faces, normals, _ = measure.marching_cubes(vol, **mc_kwargs)
+
+        # marching_cubes returns vertices in index*spacing coordinates; shift to physical.
+        verts = verts + gmin.astype(verts.dtype)
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        if remove_small_components:
+            mesh = self._remove_small_mesh_components(
+                mesh,
+                min_component_faces=min_component_faces,
+                min_component_area_fraction=min_component_area_fraction,
+                keep_largest_component=keep_largest_component,
+            )
+
+        # Taubin smoothing: removes residual marching-cubes faceting without the
+        # volumetric shrinkage of plain Laplacian smoothing.
+        if smooth_iterations and int(smooth_iterations) > 0:
+            try:
+                from trimesh import smoothing as _smoothing
+
+                _smoothing.filter_taubin(
+                    mesh,
+                    lamb=float(smooth_taubin_lambda),
+                    nu=float(smooth_taubin_nu),
+                    iterations=int(smooth_iterations),
+                )
+            except Exception as _e:
+                print(f"\tTaubin smoothing skipped: {_e}")
+
+        if lengthScale != 1.0:
+            mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * lengthScale
+            print(f"	Applied STL lengthScale={lengthScale:.6g} about the global origin")
+
+        out = output_filename if output_filename.lower().endswith(".stl") else output_filename + ".stl"
+        mesh.export(out)
+        print(
+            f"\tIso-surface ({len(mesh.vertices):,} verts, {len(mesh.faces):,} tris) written to {out} "
+            f"in {time.perf_counter() - tic:.1f} s"
+        )
+        return mesh
+
+    def to_isosurface_stl(
+        self,
+        output_filename,
+        field_neon_dict,
+        field_base_name,
+        iso_value,
+        derived=None,
+        component=None,
+        exclude_solids=True,
+        body_handling="cap",
+        fill_value=None,
+        remove_trapped_fluid=True,
+        bounds=None,
+        pitch=None,
+        grid_resolution=512,
+        interpolation="idw",
+        k=8,
+        power=2.0,
+        smooth_iterations=10,
+        step_size=1,
+        lengthScale=1.0,
+        remove_small_components=True,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
+    ):
+        """Export an iso-surface of any base or derived scalar as an STL file.
+
+        Parameters
+        ----------
+        field_neon_dict : dict
+            NEON fields to extract, e.g. ``{"velocity": sim.u, "density": sim.rho,
+            "bc_mask": sim.bc_mask}``. Include whatever base fields the chosen
+            quantity needs, plus ``bc_mask`` when ``exclude_solids`` is True.
+        field_base_name : str
+            Quantity to contour: a base field ("velocity", "density") or a derived
+            one ("Cp", "CpTotal", "CpTotalLoss", "pressure", "qdyn"). Vectors are
+            reduced to magnitude unless ``component`` is given.
+        iso_value : float
+            Iso level, in the field's physical units (m/s for velocity,
+            dimensionless for Cp/CpTotal, Pa for pressure, ...).
+        derived : list[str], optional
+            Derived fields to synthesize (passed to get_fields_data). Required when
+            ``field_base_name`` is a derived quantity, e.g. ``derived=["CpTotal"]``.
+        component : int, optional
+            Vector component to contour; None contours the magnitude.
+        exclude_solids : bool
+            Drop solid (bc_mask==255) cells from the interpolation source so their
+            data never contributes (requires ``bc_mask`` in field_neon_dict).
+        body_handling : {"cap", "open"}
+            What the surface does at the body. "cap" (default) stamps the ambient
+            free-stream value into the body interior for a closed surface that
+            terminates at the skin; "open" leaves a masked hole there.
+        fill_value : float, optional
+            Ambient constant (in the field's physical units) used when
+            ``body_handling="cap"``. Defaults to an auto-inferred free-stream value
+            for known quantities (Cp=0, CpTotal=1, CpTotalLoss=0, velocity
+            magnitude=U_inf, density/pressure/qdyn from the UnitConvertor). If it
+            cannot be inferred (and none is given), capping falls back to "open".
+        lengthScale : float, optional
+            Multiplies final STL vertex coordinates about the global origin only.
+            Use 1000.0 to export meter-based results as millimeter-sized STL
+            coordinates without shifting the origin.
+        remove_small_components : bool, optional
+            Remove tiny disconnected iso-surface islands created by sampled-field
+            noise/voxel artifacts. ``min_component_faces`` and
+            ``min_component_area_fraction`` control the threshold; set
+            ``keep_largest_component=True`` for aggressive cleanup.
+
+        Remaining parameters control the resample grid / smoothing; see
+        :meth:`_scalar_to_isosurface_stl`.
+        """
+        fields_data = self.get_fields_data(field_neon_dict, derived=derived)
+        field_name, scalar = self._select_surface_field(fields_data, field_base_name, component=component)
+        solid_mask = self._solid_mask_from_fields_data(fields_data) if exclude_solids else None
+
+        if fill_value is None:
+            fill_value = self._infer_ambient_fill(field_base_name, component=component)
+
+        return self._scalar_to_isosurface_stl(
+            f"{output_filename}_{field_name}",
+            scalar,
+            iso_value,
+            solid_mask=solid_mask,
+            bounds=bounds,
+            pitch=pitch,
+            grid_resolution=grid_resolution,
+            interpolation=interpolation,
             k=k,
             power=power,
-            max_distance=max_distance,
-            half_space_tolerance=half_space_tolerance,
-            aggregate=aggregate,
             smooth_iterations=smooth_iterations,
-            smooth_relaxation=smooth_relaxation,
-            export_debug_arrays=export_debug_arrays,
+            step_size=step_size,
+            body_handling=body_handling,
+            fill_value=fill_value,
+            remove_trapped_fluid=remove_trapped_fluid,
+            lengthScale=lengthScale,
+            remove_small_components=remove_small_components,
+            min_component_faces=min_component_faces,
+            min_component_area_fraction=min_component_area_fraction,
+            keep_largest_component=keep_largest_component,
         )
-    
+
+    def to_isosurface_stl_time_average(
+        self,
+        output_filename,
+        field_base_name,
+        iso_value,
+        bc_mask_neon=None,
+        component=None,
+        exclude_solids=True,
+        body_handling="cap",
+        fill_value=None,
+        remove_trapped_fluid=True,
+        keep_state=True,
+        bounds=None,
+        pitch=None,
+        grid_resolution=512,
+        interpolation="idw",
+        k=8,
+        power=2.0,
+        smooth_iterations=10,
+        step_size=1,
+        lengthScale=1.0,
+        remove_small_components=True,
+        min_component_faces=64,
+        min_component_area_fraction=1e-6,
+        keep_largest_component=False,
+    ):
+        """Export a time-averaged iso-surface of any accumulated base/derived scalar.
+
+        Uses the accumulated time-average (see :meth:`finalize_time_average`). The
+        field must have been accumulated (base fields, plus any derived names passed
+        to ``accumulate_time_average(..., derived=[...])``). ``bc_mask`` is not part
+        of the accumulator, so pass the static ``bc_mask`` NEON field via
+        ``bc_mask_neon`` (e.g. ``sim.bc_mask``) to exclude solids.
+
+        See :meth:`to_isosurface_stl` for the field/grid/smoothing parameters.
+        """
+        avg_fields = self.finalize_time_average(keep_state=keep_state)
+        field_name, scalar = self._select_surface_field(avg_fields, field_base_name, component=component)
+
+        solid_mask = None
+        if exclude_solids:
+            if bc_mask_neon is None:
+                raise ValueError(
+                    "exclude_solids=True requires bc_mask_neon (e.g. sim.bc_mask); "
+                    "bc_mask is not part of the time-average accumulator."
+                )
+            bc_fields = self.get_fields_data({"bc_mask": bc_mask_neon})
+            solid_mask = self._solid_mask_from_fields_data(bc_fields)
+
+        if fill_value is None:
+            fill_value = self._infer_ambient_fill(field_base_name, component=component)
+
+        return self._scalar_to_isosurface_stl(
+            f"{output_filename}_{field_name}",
+            scalar,
+            iso_value,
+            solid_mask=solid_mask,
+            bounds=bounds,
+            pitch=pitch,
+            grid_resolution=grid_resolution,
+            interpolation=interpolation,
+            k=k,
+            power=power,
+            smooth_iterations=smooth_iterations,
+            step_size=step_size,
+            body_handling=body_handling,
+            fill_value=fill_value,
+            remove_trapped_fluid=remove_trapped_fluid,
+            lengthScale=lengthScale,
+            remove_small_components=remove_small_components,
+            min_component_faces=min_component_faces,
+            min_component_area_fraction=min_component_area_fraction,
+            keep_largest_component=keep_largest_component,
+        )

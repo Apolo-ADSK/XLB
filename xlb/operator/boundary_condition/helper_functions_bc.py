@@ -539,7 +539,7 @@ class HelperFunctionsBC(object):
             u_neighbor = _u_vec()
             for d in range(_d):
                 has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, compute_dtype(0.0), has_neihbor))
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_n, d, store_dtype(0.0), has_neihbor))
                 if has_neihbor:                    
                     u_neighbor[d] = f_aux
 
@@ -593,14 +593,14 @@ class HelperFunctionsBC(object):
             f_rho_upstream = rho_center
             has_upstrem = wp.bool(False)
             f_aux = compute_dtype(
-            wp.neon_read_ngh(_rho, index, ngh_uf, 0, compute_dtype(0.0), has_upstrem))
+            wp.neon_read_ngh(_rho, index, ngh_uf, 0, store_dtype(0.0), has_upstrem))
             if has_upstrem:                    
                 f_rho_upstream = f_aux
 
             f_u_upstream = u_neighbor
             for d in range(_d):
                 has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_uf, d, compute_dtype(0.0), has_neihbor))
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_uf, d, store_dtype(0.0), has_neihbor))
                 if has_neihbor:                    
                     f_u_upstream[d] = f_aux
 
@@ -611,14 +611,14 @@ class HelperFunctionsBC(object):
             f_rho_downstream = rho_center
             has_downstream = wp.bool(False)
             f_aux = compute_dtype(
-                wp.neon_read_ngh(_rho, index, ngh_df, 0, compute_dtype(0.0), has_downstream))
+                wp.neon_read_ngh(_rho, index, ngh_df, 0, store_dtype(0.0), has_downstream))
             if has_downstream:                    
                 f_rho_downstream = f_aux  
                 
             f_u_downstream = u_neighbor
             for d in range(_d):
                 has_neihbor = wp.bool(False)
-                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, compute_dtype(0.0), has_neihbor))
+                f_aux = compute_dtype(wp.neon_read_ngh(_u, index, ngh_df, d, store_dtype(0.0), has_neihbor))
                 if has_neihbor:                    
                     f_u_downstream[d] = f_aux    
 
@@ -722,7 +722,7 @@ class HelperFunctionsBC(object):
             for d in range(_d):
                 u_B[d] = compute_dtype(wp.neon_read(_u, index, d))
 
-            nu = wp.max(nu, _epsilon)
+            nu = wp.max(compute_dtype(nu), _epsilon)
 
             # -----------------------------------------------------------------
             # TANGENTIAL VELOCITY AND STREAMWISE DIRECTION AT B
