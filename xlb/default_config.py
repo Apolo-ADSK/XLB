@@ -89,7 +89,7 @@ def init(velocity_set, default_backend, default_precision_policy):
         _warp_init_and_select_cuda_device()
 
         # It's a good idea to always clear the kernel cache when developing new native or codegen features
-        wp.build.clear_kernel_cache()
+        wp.clear_kernel_cache()
 
         # !!! DO THIS BEFORE DEFINING/USING ANY KERNELS WITH CUSTOM TYPES
         neon.init()

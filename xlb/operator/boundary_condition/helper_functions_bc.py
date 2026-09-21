@@ -61,13 +61,36 @@ class HelperFunctionsBC(object):
         _c_float = self.velocity_set.c_float
         _cs2 = compute_dtype(self.velocity_set.cs2)
         _qi = self.velocity_set.qi
-        _u_vec = wp.vec(_d, dtype=compute_dtype)
-        _f_vec = wp.vec(_q, dtype=compute_dtype)
-        _missing_mask_vec = wp.vec(_q, dtype=wp.uint8)  # TODO fix vec bool
+        _u_vec = wp.types.vector(_d, dtype=compute_dtype)
+        _f_vec = wp.types.vector(_q, dtype=compute_dtype)
+        _missing_mask_vec = wp.types.vector(_q, dtype=wp.uint8)  # TODO fix vec bool
         _nt = _d * (_d + 1) // 2
         _epsilon = compute_dtype(1e-6)
         # Wall model constants
         _kappa = compute_dtype(0.41)  # von Karman constant
+        _rolloff_start = wp.sin(compute_dtype(2.5)*compute_dtype(0.017453292519943295))
+        _rolloff_full  = wp.sin(compute_dtype(17.0)*compute_dtype(0.017453292519943295))
+
+        # Sandwich detection tests whether a direction and its opposite are both
+        # missing. That predicate is symmetric, so one member of each opposite
+        # pair is enough: 14 tests instead of 27. 14 is also <= Warp's default
+        # max_unroll of 16, so the loop unrolls and the missing-mask vector stays
+        # in registers instead of local memory. Index 0 is included because
+        # opp[0] == 0, which makes its pair test reduce to mask[0] == 1 -- exactly
+        # the l = 0 iteration of the original range(_q) loop.
+        _pair_a_py = [0]
+        _pair_b_py = [0]
+        _pair_seen = {0}
+        for _l in range(1, int(self.velocity_set.q)):
+            _o = int(self.velocity_set._opp_indices[_l])
+            if _l not in _pair_seen and _o not in _pair_seen:
+                _pair_a_py.append(_l)
+                _pair_b_py.append(_o)
+                _pair_seen.add(_l)
+                _pair_seen.add(_o)
+        _n_pairs = len(_pair_a_py)
+        _pair_a = wp.constant(wp.types.vector(_n_pairs, dtype=wp.int32)(_pair_a_py))
+        _pair_b = wp.constant(wp.types.vector(_n_pairs, dtype=wp.int32)(_pair_b_py))
 
         # Define the operator needed for computing equilibrium
         equilibrium = QuadraticEquilibrium(velocity_set, precision_policy, compute_backend)
@@ -177,11 +200,9 @@ class HelperFunctionsBC(object):
             Regularizes the distribution functions by adding non-equilibrium contributions based on second moments of fpop.
             """
             # Compute momentum flux of off-equilibrium populations for regularization: Pi^1 = Pi^{neq}
-            f_neq = fpop - feq
-            PiNeq = momentum_flux.warp_functional(f_neq)
-            zero = compute_dtype(0.0)
-            three = compute_dtype(3.0)
-            trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / three
+            fpop -= feq
+            PiNeq = momentum_flux.warp_functional(fpop)
+            trace = (PiNeq[0] + PiNeq[3] + PiNeq[5]) / compute_dtype(3.0)
 
             # Compute double dot product Qi:Pi1 (where Pi1 = PiNeq)            
             for l in range(_q):
@@ -193,10 +214,8 @@ class HelperFunctionsBC(object):
                         QiPi += _qi[l, t] * PiNeq[t]
 
                 # assign all populations based on eq 45 of Latt et al (2008)
-                # fneq ~ f^1
-                fpop1 = compute_dtype(4.5) * _w[l] * QiPi
-                fpop[l] = feq[l] + fpop1                
-                fpop[l] = wp.max(fpop[l], _epsilon)
+                # fneq ~ f^1             
+                fpop[l] = wp.max(feq[l] + compute_dtype(4.5) * _w[l] * QiPi, _epsilon)        
 
             return fpop
 
@@ -452,6 +471,44 @@ class HelperFunctionsBC(object):
             return wp.max(d_log + d_damping, _epsilon)
 
         @wp.func
+        def reichardt_profile_and_derivative(y_plus: Any):
+            """Reichardt u+(y+) and its derivative du+/dy+, computed together.
+
+            The profile and the derivative both need exp(-y+/C), exp(-y+/C3)
+            and (1 + kappa*y+). Calling them separately, as the Newton loop
+            below used to, evaluates each of those twice per iteration. Doing
+            it once here is bitwise identical -- the same values produced by
+            the same operations -- and halves the exponentials in the loop.
+            """
+            C = compute_dtype(11.0)
+            C3 = compute_dtype(3.0)
+
+            # shared subexpressions
+            kap_y = compute_dtype(1.0) + _kappa * y_plus
+            exp_C = wp.exp(-y_plus / C)
+            exp_C3 = wp.exp(-y_plus / C3)
+
+            # profile, as in reichardt_profile()
+            log_term = (compute_dtype(1.0) / _kappa) * wp.log(kap_y)
+            damping = compute_dtype(8.5) * (
+                compute_dtype(1.0)
+                - exp_C
+                - (y_plus / C) * exp_C3
+            )
+            u_plus = wp.max(log_term + damping, compute_dtype(0.0))
+
+            # derivative, as in reichardt_derivative()
+            d_log = compute_dtype(1.0) / kap_y
+            d_damping = compute_dtype(8.5) * (
+                exp_C / C
+                - (compute_dtype(1.0) / C) * exp_C3
+                + (y_plus / (C * C3)) * exp_C3
+            )
+            du_dy = wp.max(d_log + d_damping, _epsilon)
+
+            return u_plus, du_dy
+
+        @wp.func
         def solve_wall_function(K: Any) -> Any:
             """
             Solve for u_plus given K = |u_parallel| * y / nu = y+ * u+.
@@ -468,15 +525,16 @@ class HelperFunctionsBC(object):
                 u_plus = wp.sqrt(K / wp.max(wp.log(K), compute_dtype(1.0)))
 
             # Newton iteration: solve g(u+) = u+ - profile(K/u+) = 0
-            for _ in range(15):
+            for _ in range(4):
                 y_plus = K / wp.max(u_plus, _epsilon)
-                u_profile = reichardt_profile(y_plus)
+                # One call instead of two: the profile and its derivative share
+                # exp(-y+/C), exp(-y+/C3) and (1 + kappa*y+).
+                u_profile, du_dy = reichardt_profile_and_derivative(y_plus)
                 residual = u_plus - u_profile
 
-                if wp.abs(residual) < compute_dtype(1e-6) * wp.max(u_plus, compute_dtype(1.0)):
-                    break
+                # if wp.abs(residual) < compute_dtype(1e-6) * wp.max(u_plus, compute_dtype(1.0)):
+                #     break
 
-                du_dy = reichardt_derivative(y_plus)
                 g_prime = compute_dtype(1.0) + du_dy * K / (u_plus * u_plus + _epsilon)
 
                 delta = residual / wp.max(g_prime, _epsilon)
@@ -486,12 +544,11 @@ class HelperFunctionsBC(object):
             return wp.max(u_plus, _epsilon)
 
         @wp.func
-        def sample_neighbor(
+        def sample_neighbor0(
             index: Any,
             normal: Any,
             _rho: Any, 
             _u: Any,
-            f_1: Any,
             streamwise: Any,
         ):
             """
@@ -507,25 +564,31 @@ class HelperFunctionsBC(object):
             # ============================================================
             best_n_l   = wp.int32(0)
             best_n_dot = compute_dtype(-1.0e9)
+            best_n_step = wp.vec3i(0, 0, 0)
             for l in range(1, _q):
                 # Start with 1 as zero is rest position
+                # NOTE: the zero-velocity and |c| <= epsilon guards that used to be
+                # here were dead code: every lattice link with l >= 1 has |c| >= 1.
+                # They used `continue`, which stops Warp unrolling this loop. Without
+                # the unroll `l` stays a runtime value, so the vectors indexed by it
+                # are forced into local memory. Removed so the loop unrolls.
                 cx = _c_float[0, l]
                 cy = _c_float[1, l]
                 cz = _c_float[2, l]
-                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
-                    continue
                 c    = wp.vec3(cx, cy, cz)
                 cmag = wp.length(c)
-                if cmag <= _epsilon:
-                    continue
                 c_unit = c / cmag
                 a = wp.dot(c_unit, normal)
                 if a > best_n_dot:
                     best_n_dot = a
                     best_n_l   = wp.int32(l)
+                    # Capture the step here, where `l` is a compile-time constant.
+                    # Indexing _c with the data-dependent best_n_l afterwards forced
+                    # the constant 3x27 matrix into local memory.
+                    best_n_step = wp.vec3i(_c[0, l], _c[1, l], _c[2, l])
 
             # Flip if best dot was negative.
-            step_dir = wp.vec3i(_c[0, best_n_l], _c[1, best_n_l], _c[2, best_n_l])
+            step_dir = best_n_step
             if best_n_dot < compute_dtype(0.0):
                 step_dir = -step_dir
             
@@ -550,25 +613,31 @@ class HelperFunctionsBC(object):
             # ============================================================
             best_s_l   = wp.int32(0)
             best_s_dot = compute_dtype(-1.0e9)
+            best_s_step = wp.vec3i(0, 0, 0)
             for l in range(1, _q):
                 # Start with 1 as zero is rest position
+                # NOTE: the zero-velocity and |c| <= epsilon guards that used to be
+                # here were dead code: every lattice link with l >= 1 has |c| >= 1.
+                # They used `continue`, which stops Warp unrolling this loop. Without
+                # the unroll `l` stays a runtime value, so the vectors indexed by it
+                # are forced into local memory. Removed so the loop unrolls.
                 cx = _c_float[0, l]
                 cy = _c_float[1, l]
                 cz = _c_float[2, l]
-                if (cx == compute_dtype(0.0)) and (cy == compute_dtype(0.0)) and (cz == compute_dtype(0.0)):
-                    continue
                 c    = wp.vec3(cx, cy, cz)
                 cmag = wp.length(c)
-                if cmag <= _epsilon:
-                    continue
                 c_unit = c / cmag
                 a = wp.dot(c_unit, streamwise)                
                 if a > best_s_dot:
                     best_s_dot = a
                     best_s_l   = wp.int32(l)
+                    # Capture the step here, where `l` is a compile-time constant.
+                    # Indexing _c with the data-dependent best_s_l afterwards forced
+                    # the constant 3x27 matrix into local memory.
+                    best_s_step = wp.vec3i(_c[0, l], _c[1, l], _c[2, l])
 
             # Flip if best dot was negative.            
-            stream_step = wp.vec3i(_c[0, best_s_l], _c[1, best_s_l], _c[2, best_s_l])
+            stream_step = best_s_step
             if best_s_dot < compute_dtype(0.0):
                 stream_step = -stream_step
             #Test reaching 2 voxels away rather than just 1 out from center
@@ -682,6 +751,389 @@ class HelperFunctionsBC(object):
             return u_neighbor, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent
             
         @wp.func
+        def sample_neighbor(
+            index: Any,
+            normal: Any,
+            _rho: Any,
+            _u: Any,
+            streamwise: Any,
+        ):
+            """
+            Sample the wall-normal neighbor and streamwise upstream/downstream
+            locations used by the wall model.
+
+            Drop-in replacement preserving the original return signature:
+                u_neighbor,
+                rho_up,
+                rho_down,
+                neighbor_dist,
+                streamwise,
+                streamwise_dist,
+                coherent
+            """
+
+            zero = compute_dtype(0.0)
+            one = compute_dtype(1.0)
+
+            # ============================================================
+            # Find NORMAL and STREAMWISE lattice links in one pass.
+            # ============================================================
+
+            best_n_l = wp.int32(0)
+            best_s_l = wp.int32(0)
+
+            best_n_dot = compute_dtype(-1.0e9)
+            best_s_dot = compute_dtype(-1.0e9)
+
+            for l in range(1, _q):
+
+                cx = _c_float[0, l]
+                cy = _c_float[1, l]
+                cz = _c_float[2, l]
+
+                # |c|^2.  All non-rest D3Q27 links are non-zero.
+                c_mag_sq = cx * cx + cy * cy + cz * cz
+
+                if c_mag_sq > _epsilon:
+
+                    inv_c_mag = one / wp.sqrt(c_mag_sq)
+
+                    # Alignment with wall normal.
+                    dot_n = (
+                        cx * normal[0]
+                        + cy * normal[1]
+                        + cz * normal[2]
+                    ) * inv_c_mag
+
+                    if dot_n > best_n_dot:
+                        best_n_dot = dot_n
+                        best_n_l = wp.int32(l)
+
+                    # Alignment with local streamwise direction.
+                    dot_s = (
+                        cx * streamwise[0]
+                        + cy * streamwise[1]
+                        + cz * streamwise[2]
+                    ) * inv_c_mag
+
+                    if dot_s > best_s_dot:
+                        best_s_dot = dot_s
+                        best_s_l = wp.int32(l)
+
+            # ============================================================
+            # Normal step
+            # ============================================================
+
+            step_dir = wp.vec3i(
+                _c[0, best_n_l],
+                _c[1, best_n_l],
+                _c[2, best_n_l],
+            )
+
+            if best_n_dot < zero:
+                step_dir = -step_dir
+
+            ngh_n = wp.neon_ngh_idx(
+                wp.int8(step_dir[0]),
+                wp.int8(step_dir[1]),
+                wp.int8(step_dir[2]),
+            )
+
+            # Wall-normal neighbor velocity.
+            u_neighbor = _u_vec()
+
+            for d in range(_d):
+                has_neighbor = wp.bool(False)
+
+                u_aux = compute_dtype(
+                    wp.neon_read_ngh(
+                        _u,
+                        index,
+                        ngh_n,
+                        d,
+                        zero,
+                        has_neighbor,
+                    )
+                )
+
+                if has_neighbor:
+                    u_neighbor[d] = u_aux
+
+            step_x = compute_dtype(step_dir[0])
+            step_y = compute_dtype(step_dir[1])
+            step_z = compute_dtype(step_dir[2])
+
+            neighbor_dist = wp.sqrt(
+                step_x * step_x
+                + step_y * step_y
+                + step_z * step_z
+            )
+
+            # ============================================================
+            # Streamwise step
+            # ============================================================
+
+            stream_step = wp.vec3i(
+                _c[0, best_s_l],
+                _c[1, best_s_l],
+                _c[2, best_s_l],
+            )
+
+            if best_s_dot < zero:
+                stream_step = -stream_step
+
+            # Current model samples two voxels from F.
+            stream_step *= 2
+
+            stream_x = compute_dtype(stream_step[0])
+            stream_y = compute_dtype(stream_step[1])
+            stream_z = compute_dtype(stream_step[2])
+
+            upstream_dist = wp.sqrt(
+                stream_x * stream_x
+                + stream_y * stream_y
+                + stream_z * stream_z
+            )
+
+            # Distance from upstream sample to downstream sample.
+            streamwise_dist = wp.max(
+                compute_dtype(2.0) * upstream_dist,
+                _epsilon,
+            )
+
+            # ============================================================
+            # UPSTREAM VELOCITY / COHERENCE
+            # ============================================================
+
+            upstream_off = wp.vec3i(
+                step_dir[0] - stream_step[0],
+                step_dir[1] - stream_step[1],
+                step_dir[2] - stream_step[2],
+            )
+
+            ngh_up = wp.neon_ngh_idx(
+                wp.int8(upstream_off[0]),
+                wp.int8(upstream_off[1]),
+                wp.int8(upstream_off[2]),
+            )
+
+            # Preserve original fallback behavior.
+            u_upstream = u_neighbor
+
+            for d in range(_d):
+                has_neighbor = wp.bool(False)
+
+                u_aux = compute_dtype(
+                    wp.neon_read_ngh(
+                        _u,
+                        index,
+                        ngh_up,
+                        d,
+                        zero,
+                        has_neighbor,
+                    )
+                )
+
+                if has_neighbor:
+                    u_upstream[d] = u_aux
+
+            # Remove wall-normal component.
+            up_dot_n = (
+                u_upstream[0] * normal[0]
+                + u_upstream[1] * normal[1]
+                + u_upstream[2] * normal[2]
+            )
+
+            up_tx = u_upstream[0] - normal[0] * up_dot_n
+            up_ty = u_upstream[1] - normal[1] * up_dot_n
+            up_tz = u_upstream[2] - normal[2] * up_dot_n
+
+            up_tangent_sq = (
+                up_tx * up_tx
+                + up_ty * up_ty
+                + up_tz * up_tz
+            )
+
+            up_projection = (
+                streamwise[0] * up_tx
+                + streamwise[1] * up_ty
+                + streamwise[2] * up_tz
+            )
+
+            # Original test:
+            #
+            # dot(streamwise, tangent / |tangent|) > 0.25
+            #
+            # Equivalent positive-direction squared test avoids constructing
+            # and retaining a normalized tangent vector.
+            dot_tol = compute_dtype(0.25)
+            dot_tol_sq = dot_tol * dot_tol
+            eps_sq = _epsilon * _epsilon
+
+            upstream_coherent = (
+                (up_tangent_sq > eps_sq)
+                and (up_projection > zero)
+                and (
+                    up_projection * up_projection
+                    > dot_tol_sq * up_tangent_sq
+                )
+            )
+
+            # If upstream is already incoherent, downstream cannot make the
+            # original AND condition true. Avoid all downstream reads/state.
+            if not upstream_coherent:
+
+                rho_center = compute_dtype(
+                    wp.neon_read(_rho, index, 0)
+                )
+
+                return (
+                    u_neighbor,
+                    rho_center,
+                    rho_center,
+                    neighbor_dist,
+                    streamwise,
+                    streamwise_dist,
+                    zero,
+                )
+
+            # ============================================================
+            # DOWNSTREAM VELOCITY / COHERENCE
+            # ============================================================
+
+            downstream_off = wp.vec3i(
+                step_dir[0] + stream_step[0],
+                step_dir[1] + stream_step[1],
+                step_dir[2] + stream_step[2],
+            )
+
+            ngh_down = wp.neon_ngh_idx(
+                wp.int8(downstream_off[0]),
+                wp.int8(downstream_off[1]),
+                wp.int8(downstream_off[2]),
+            )
+
+            # Preserve original fallback behavior.
+            u_downstream = u_neighbor
+
+            for d in range(_d):
+                has_neighbor = wp.bool(False)
+
+                u_aux = compute_dtype(
+                    wp.neon_read_ngh(
+                        _u,
+                        index,
+                        ngh_down,
+                        d,
+                        zero,
+                        has_neighbor,
+                    )
+                )
+
+                if has_neighbor:
+                    u_downstream[d] = u_aux
+
+            down_dot_n = (
+                u_downstream[0] * normal[0]
+                + u_downstream[1] * normal[1]
+                + u_downstream[2] * normal[2]
+            )
+
+            down_tx = u_downstream[0] - normal[0] * down_dot_n
+            down_ty = u_downstream[1] - normal[1] * down_dot_n
+            down_tz = u_downstream[2] - normal[2] * down_dot_n
+
+            down_tangent_sq = (
+                down_tx * down_tx
+                + down_ty * down_ty
+                + down_tz * down_tz
+            )
+
+            down_projection = (
+                streamwise[0] * down_tx
+                + streamwise[1] * down_ty
+                + streamwise[2] * down_tz
+            )
+
+            downstream_coherent = (
+                (down_tangent_sq > eps_sq)
+                and (down_projection > zero)
+                and (
+                    down_projection * down_projection
+                    > dot_tol_sq * down_tangent_sq
+                )
+            )
+
+            if not downstream_coherent:
+
+                rho_center = compute_dtype(
+                    wp.neon_read(_rho, index, 0)
+                )
+
+                return (
+                    u_neighbor,
+                    rho_center,
+                    rho_center,
+                    neighbor_dist,
+                    streamwise,
+                    streamwise_dist,
+                    zero,
+                )
+
+            # ============================================================
+            # Both velocity samples are coherent.
+            # Only now load the density samples.
+            # ============================================================
+
+            rho_center = compute_dtype(
+                wp.neon_read(_rho, index, 0)
+            )
+
+            rho_up = rho_center
+            has_upstream = wp.bool(False)
+
+            rho_aux = compute_dtype(
+                wp.neon_read_ngh(
+                    _rho,
+                    index,
+                    ngh_up,
+                    0,
+                    zero,
+                    has_upstream,
+                )
+            )
+
+            if has_upstream:
+                rho_up = rho_aux
+
+            rho_down = rho_center
+            has_downstream = wp.bool(False)
+
+            rho_aux = compute_dtype(
+                wp.neon_read_ngh(
+                    _rho,
+                    index,
+                    ngh_down,
+                    0,
+                    zero,
+                    has_downstream,
+                )
+            )
+
+            if has_downstream:
+                rho_down = rho_aux
+
+            return (
+                u_neighbor,
+                rho_up,
+                rho_down,
+                neighbor_dist,
+                streamwise,
+                streamwise_dist,
+                one,
+            )
+
+        @wp.func
         def compute_wall_modeled_velocity(
             index: Any,
             _missing_mask: Any,
@@ -702,8 +1154,8 @@ class HelperFunctionsBC(object):
             # -----------------------------------------------------------------
             # SANDWICH DETECTION
             # -----------------------------------------------------------------
-            for l in range(_q):
-                if _missing_mask[l] == wp.uint8(1) and _missing_mask[_opp_indices[l]] == wp.uint8(1):
+            for i in range(_n_pairs):
+                if _missing_mask[_pair_a[i]] == wp.uint8(1) and _missing_mask[_pair_b[i]] == wp.uint8(1):
                     return u_wall, _relax
 
             # -----------------------------------------------------------------
@@ -741,7 +1193,7 @@ class HelperFunctionsBC(object):
             # NEIGHBOR SAMPLING
             # -----------------------------------------------------------------
             u_f, rho_up, rho_down, neighbor_dist, streamwise, streamwise_dist, coherent = sample_neighbor(
-                index, normal, _rho, _u, f_1, streamwiseb
+                index, normal, _rho, _u, streamwiseb
             )
 
             # =================================================================
@@ -750,22 +1202,22 @@ class HelperFunctionsBC(object):
             y_f = y_b + neighbor_dist
 
             u_f_rel = u_f - u_wall
-            u_f_mag = wp.length(u_f_rel)
+            
 
             # Tangential direction at F (safe fallback)
-            u_f_norm = wp.dot(u_f_rel, normal)
-            u_f_tangent = u_f_rel - normal * u_f_norm
-            u_f_tangent_len = wp.length(u_f_tangent)
-            if u_f_tangent_len > _epsilon:
-                streamwisef = u_f_tangent / u_f_tangent_len
-            else:
-                streamwisef = streamwise          
+            # u_f_norm = wp.dot(u_f_rel, normal)
+            # u_f_tangent = u_f_rel - normal * u_f_norm
+            # u_f_tangent_len = wp.length(u_f_tangent)
+            # if u_f_tangent_len > _epsilon:
+            #     streamwisef = u_f_tangent / u_f_tangent_len
+            # else:
+            #     streamwisef = streamwise          
 
             # Use B-streamwise for signed streamwise speed
             u_f_signed = wp.dot(u_f_rel, streamwise)
             u_f_par_mag = wp.abs(u_f_signed)
 
-            u_f_fwd = wp.dot(u_f_rel, streamwiseb)
+            # u_f_fwd = wp.dot(u_f_rel, streamwiseb)
 
             if u_f_par_mag < _epsilon:
                 return u_wall, _relax
@@ -845,37 +1297,38 @@ class HelperFunctionsBC(object):
                    
             separation_gate = one
             if pg_avg > zero:
+                u_f_mag = wp.length(u_f_rel)
                 f_angle = wp.dot(u_f_rel / wp.max(u_f_mag, _epsilon), normal) 
-                deg_to_rad = compute_dtype(0.017453292519943295)
-                rad_to_deg = compute_dtype(57.29577951308232)
-                f_angle_deg = wp.asin(f_angle) * rad_to_deg  
+                #deg_to_rad = compute_dtype(0.017453292519943295)
+                #rad_to_deg = compute_dtype(57.29577951308232)
+                #f_angle_deg = wp.asin(f_angle) * rad_to_deg  
 
                 # Base liftoff rolloff in separation-angle space
-                separation_rolloff_start_deg = compute_dtype(2.5)
-                separation_rolloff_full_deg  = compute_dtype(17.0)
+                #separation_rolloff_start_deg = compute_dtype(2.5)
+                #separation_rolloff_full_deg  = compute_dtype(17.0)
 
                 # FPG shield tuning in degree space
                 # fpg_shield_start_pg   = compute_dtype(-0.1)  # shield begins once pg_avg goes below this
                 # fpg_shield_deg_per_pg = compute_dtype(60.0)   # protection gained per 1.0 of extra negative pg_avg
                 # fpg_shield_max_deg    = compute_dtype(12.0)   # cap on total shield protection
 
-                shield_shift_deg = compute_dtype(0.0)
+                #shield_shift_deg = compute_dtype(0.0)
                 # if pg_avg < fpg_shield_start_pg:
                 #     shield_shift_deg = wp.min(
                 #         (fpg_shield_start_pg - pg_avg) * fpg_shield_deg_per_pg,
                 #         fpg_shield_max_deg,
                 #     )
 
-                rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
-                rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
+                #rolloff_start_deg = separation_rolloff_start_deg + shield_shift_deg
+                #rolloff_full_deg  = separation_rolloff_full_deg  + shield_shift_deg
+                
+                #rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
+                #rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
+                rolloff_full  = wp.max(_rolloff_full, _rolloff_start + compute_dtype(1.0e-6))
 
-                rolloff_start = wp.sin(rolloff_start_deg * deg_to_rad)
-                rolloff_full  = wp.sin(rolloff_full_deg  * deg_to_rad)
-                rolloff_full  = wp.max(rolloff_full, rolloff_start + compute_dtype(1.0e-6))
-
-                if f_angle > rolloff_start:
+                if f_angle > _rolloff_start:
                     penalty = wp.clamp(
-                        (f_angle - rolloff_start) / (rolloff_full - rolloff_start),
+                        (f_angle - _rolloff_start) / (rolloff_full - _rolloff_start),
                         zero,
                         one,
                     )
@@ -984,7 +1437,7 @@ class EncodeAuxiliaryData(Operator):
         _opp_indices = self.velocity_set.opp_indices
         _id = self.boundary_id
         _num_of_aux_data = self.num_of_aux_data
-        _aux_vec = wp.vec(_num_of_aux_data, dtype=self.compute_dtype)
+        _aux_vec = wp.types.vector(_num_of_aux_data, dtype=self.compute_dtype)
 
         @wp.func
         def encoder_functional(
